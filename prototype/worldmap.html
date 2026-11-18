@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 老地图</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #e9d8ac; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 老地图主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/old map.webp）：羊皮纸上的古地图——大陆上画满手绘的小山脉、
+  树簇和草点，红顶小屋聚成城镇，虚线陆路把城镇连起来，手写的衬线地名；
+  图标的位置是一片海域（海岸线描边、海面上有波纹线）
+  - 地形：融球场的负空间是海（s<0 图标周围）、陆地在外面——和别的主题正好相反
+  - 静态层：按 8px 采样铺海/岸线/陆地，撒山脉树簇草点，摆城镇、连虚线道路
+  - 动态层：马车在道路上往返运货；三桅帆船在海面上慢慢巡航（避开陆地）
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '老地图 · 原型',
+  // 默认值要和 themes.json 里老地图的 default 保持一致
+  params: { sigma: 90, ships: 2, wagons: 3 },
+  sliders: [
+    { key: 'sigma',  label: '海域大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'ships',  label: '帆船',     min: 0,  max: 6,   step: 1, fmt: v => v + ' 艘' },
+    { key: 'wagons', label: '马车',     min: 0,  max: 6,   step: 1, fmt: v => v + ' 辆' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 34);
+    this.ships = [];
+    this.wagons = [];
+    this.towns = []; this.roads = [];
+    this.hills = []; this.treesD = []; this.grass = []; this.labels = [];
+    this.pendingBuild = true;
+    this.buildMap();
+    this.syncShips();
+    this.syncWagons();
+  },
+
+  /* ============================================================
+     地图：羊皮纸陆地 + 城镇 + 虚线道路（icon 周围是海）
+     ============================================================ */
+  buildMap() {
+    const DK = this.dk, morph = DK.morph;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const W = DK.W, H = DK.H;
+    TRSeed = DKT.getSeed() | 1;                    // 地图随机数跟种子走：换一张整片大陆换样子
+    const rnd = TRnd();
+    const sB = morph.FB.s;
+    const land = (x, y) => DKT.sampleArr(sB, x, y) > 6;
+    // 城镇：陆地上彼此离得远的点；图标满屏时陆地窄，优先挑离海最深的候选点
+    this.towns = [];
+    const cands = [];
+    for (let k = 0; k < 500; k++) {
+      const x = 50 + rnd() * (W - 100), y = 50 + rnd() * (H - DK.TASKBAR - 100);
+      const sv = DKT.sampleArr(sB, x, y);
+      if (sv > 40) cands.push({ x, y, sv });
+    }
+    cands.sort((a, b) => b.sv - a.sv);
+    for (const c of cands) {
+      if (this.towns.length >= 9) break;
+      if (this.towns.some(t => Math.hypot(t.x - c.x, t.y - c.y) < 230)) continue;
+      const houses = [];
+      const n = 6 + Math.floor(rnd() * 5);
+      for (let i = 0; i < n; i++)
+        houses.push([c.x + (rnd() - 0.5) * 62, c.y + (rnd() - 0.5) * 40, rnd()]);
+      this.towns.push({ x: c.x, y: c.y, houses });
+    }
+    // 道路：每个城镇连到最近的 1~2 个城镇（虚线贝塞尔）
+    this.roads = [];
+    this.towns.forEach((t, i) => {
+      const near = this.towns.map((o, j) => ({ j, d: Math.hypot(o.x - t.x, o.y - t.y) }))
+        .filter(o => o.j !== i).sort((a, b) => a.d - b.d).slice(0, 2);
+      for (const o of near) {
+        if (o.d > 900) continue;
+        const key = [Math.min(i, o.j), Math.max(i, o.j)].join('-');
+        if (this.roads.some(r => r.key === key)) continue;
+        const mx = (t.x + this.towns[o.j].x) / 2 + (rnd() - 0.5) * 130;
+        const my = (t.y + this.towns[o.j].y) / 2 + (rnd() - 0.5) * 130;
+        this.roads.push({ key, a: i, b: o.j, c: [mx, my] });   // 二次贝塞尔控制点
+      }
+    });
+    // 装饰：山脉 / 树簇 / 草点（只在陆地上、离海和城镇远）
+    this.hills = []; this.treesD = []; this.grass = [];
+    for (let k = 0; k < 900; k++) {
+      const x = rnd() * W, y = rnd() * (H - DK.TASKBAR);
+      if (!land(x, y) || DKT.sampleArr(sB, x, y) < 40) continue;
+      if (this.towns.some(t => Math.hypot(t.x - x, t.y - y) < 120)) continue;
+      if (this.roads.some(r => Math.hypot(r.c[0] - x, r.c[1] - y) < 60)) continue;
+      const kind = rnd();
+      if (kind < 0.22 && this.hills.length < 26) {             // 山脉：2~4 个小三角连成一排
+        const n = 2 + Math.floor(rnd() * 3), ms = [];
+        for (let i = 0; i < n; i++) ms.push([x + i * 16, y + (rnd() - 0.5) * 8, 7 + rnd() * 6]);
+        this.hills.push(ms);
+      } else if (kind < 0.42 && this.treesD.length < 30) {     // 树簇
+        this.treesD.push({ x, y, r: 4 + rnd() * 3 });
+      } else if (kind < 0.75 && this.grass.length < 130) {     // 小草点
+        this.grass.push([x, y]);
+      }
+    }
+    // 地名：大陆上两三个手写衬线地名
+    this.labels = [];
+    const NAMES = ['TERRA NOVA', 'CAMP VERDE', 'PORTO ALTO', 'VAL D\'ORO'];
+    for (let i = 0; i < 3; i++) {
+      for (let k = 0; k < 40; k++) {
+        const x = 90 + rnd() * (W - 180), y = 70 + rnd() * (H - DK.TASKBAR - 140);
+        if (!land(x, y) || DKT.sampleArr(sB, x, y) < 60) continue;
+        if (this.towns.some(t => Math.hypot(t.x - x, t.y - y) < 160)) continue;
+        if (this.labels.some(l => Math.hypot(l.x - x, l.y - y) < 260)) continue;
+        this.labels.push({ x, y, text: NAMES[i % NAMES.length] });
+        break;
+      }
+    }
+    this.dk.invalidate();
+  },
+  roadPts(r) {
+    const a = this.towns[r.a], b = this.towns[r.b];
+    if (!a || !b) return null;
+    return [a.x, a.y, r.c[0], r.c[1], b.x, b.y];
+  },
+
+  /* ============================================================
+     帆船：海域里巡航（图标周围的海）
+     ============================================================ */
+  syncShips() {
+    const DK = this.dk, P = DK.P;
+    const want = Math.max(0, Math.min(6, P.ships | 0));
+    while (this.ships.length > want) this.ships.pop();
+    while (this.ships.length < want) {
+      // 出生点：海里（s < -30）
+      let s = null;
+      for (let t = 0; t < 400 && !s; t++) {
+        const x = 60 + Math.random() * (DK.W - 120), y = 40 + Math.random() * (DK.H - DK.TASKBAR - 80);
+        if (DK.morph.sample(x, y) > -30) continue;
+        if (this.ships.some(o => Math.hypot(o.x - x, o.y - y) < 130)) continue;
+        s = { x, y, h: Math.random() * 6.283, v: 10 + Math.random() * 5, wander: Math.random() * 100, bob: Math.random() * 6.283 };
+      }
+      if (!s) break;
+      this.ships.push(s);
+    }
+  },
+  stepShips(dt) {
+    for (const sp of this.ships) {
+      // 前方接近陆地（s 变大）就转向海的深处（s 的负梯度）
+      const ax = sp.x + Math.cos(sp.h) * 60, ay = sp.y + Math.sin(sp.h) * 60;
+      if (this.dk.morph.sample(ax, ay) > -24) {
+        const gx = this.dk.morph.sample(sp.x - 10, sp.y) - this.dk.morph.sample(sp.x + 10, sp.y);
+        const gy = this.dk.morph.sample(sp.x, sp.y - 10) - this.dk.morph.sample(sp.x, sp.y + 10);
+        let d = Math.atan2(gy, gx) - sp.h;
+        d = Math.atan2(Math.sin(d), Math.cos(d));
+        sp.h += Math.sign(d) * Math.min(Math.abs(d), 1.1 * dt);
+      } else {
+        sp.h += (DKT.vnoise(sp.wander += dt * 0.3, 3) - 0.5) * 0.4 * dt;
+      }
+      sp.bob += dt * 2;
+      sp.x += Math.cos(sp.h) * sp.v * dt; sp.y += Math.sin(sp.h) * sp.v * dt;
+      if (this.dk.morph.sample(sp.x, sp.y) > -12) {            // 被陆地吞了：换个海面位置
+        const DK = this.dk;
+        for (let t = 0; t < 300; t++) {
+          const x = 60 + Math.random() * (DK.W - 120), y = 40 + Math.random() * (DK.H - DK.TASKBAR - 80);
+          if (DK.morph.sample(x, y) < -40) { sp.x = x; sp.y = y; break; }
+        }
+      }
+    }
+  },
+  drawShip(ctx, sp) {
+    ctx.save();
+    ctx.translate(sp.x, sp.y + Math.sin(sp.bob) * 1.2);
+    ctx.rotate(sp.h);
+    // 船身：深棕弧形
+    ctx.strokeStyle = '#4a3a28'; ctx.fillStyle = '#6a5238'; ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(11, 0);
+    ctx.quadraticCurveTo(5, -5.5, -6, -5);
+    ctx.quadraticCurveTo(-12, -4.5, -13, 0);
+    ctx.quadraticCurveTo(-12, 4.5, -6, 5);
+    ctx.quadraticCurveTo(5, 5.5, 11, 0);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    // 两片方形帆 + 桅杆
+    ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, -4); ctx.lineTo(0, -15); ctx.moveTo(-7, -3); ctx.lineTo(-7, -12); ctx.stroke();
+    ctx.fillStyle = '#f2e6c4';
+    ctx.beginPath();
+    ctx.moveTo(0, -14); ctx.quadraticCurveTo(7, -10, 4.5, -4); ctx.lineTo(0, -4); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-7, -11); ctx.quadraticCurveTo(-13, -7, -11, -3); ctx.lineTo(-7, -3); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ============================================================
+     马车：在城镇间的虚线道路上往返
+     ============================================================ */
+  syncWagons() {
+    const DK = this.dk, P = DK.P;
+    const want = Math.max(0, Math.min(6, P.wagons | 0));
+    this.wagons = [];
+    for (let i = 0; i < want; i++) {
+      if (!this.roads.length) break;
+      const r = this.roads[i % this.roads.length];
+      this.wagons.push({ r, t: 0.2 + 0.6 * Math.random(), v: (0.045 + Math.random() * 0.02) * (Math.random() < 0.5 ? 1 : -1), bob: Math.random() * 6.283 });
+    }
+  },
+  stepWagons(dt) {
+    for (const w of this.wagons) {
+      w.t += w.v * dt;
+      if (w.t > 0.96) { w.t = 0.96; w.v = -w.v; }
+      if (w.t < 0.04) { w.t = 0.04; w.v = -w.v; }
+      w.bob += dt * 10;
+    }
+  },
+  drawWagon(ctx, w) {
+    const pts = this.roadPts(w.r);
+    if (!pts) return;
+    const [x, y] = qbez(pts, w.t);
+    const [tx, ty] = qtan(pts, w.t);
+    const a = Math.atan2(ty, tx) + (w.v > 0 ? 0 : Math.PI);
+    const bob = Math.abs(Math.sin(w.bob)) * 1;
+    ctx.save();
+    ctx.translate(x, y - bob);
+    ctx.rotate(a);
+    // 马：车前面的两个小棕点
+    ctx.fillStyle = '#5a4030';
+    ctx.beginPath(); ctx.arc(10, -2, 2.2, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc(10, 2, 2.2, 0, 6.283); ctx.fill();
+    // 车厢 + 货箱
+    ctx.fillStyle = '#6a5238'; ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 1;
+    ctx.fillRect(-6, -3.5, 10, 7); ctx.strokeRect(-6, -3.5, 10, 7);
+    ctx.fillStyle = '#8a6a40';
+    ctx.fillRect(-4, -6, 6, 3); ctx.strokeRect(-4, -6, 6, 3);
+    // 车轮
+    ctx.fillStyle = '#3a2e24';
+    ctx.beginPath(); ctx.arc(-4, 4.5, 1.8, 0, 6.283); ctx.fill();
+    ctx.beginPath(); ctx.arc(2, 4.5, 1.8, 0, 6.283); ctx.fill();
+    ctx.restore();
+  },
+
+  /* ============================================================
+     静态层：羊皮纸底 → 采样铺海/岸线/陆地 → 装饰 → 城镇 → 道路 → 地名
+     ============================================================ */
+  drawStatic(ctx, s) {
+    const DK = this.dk, morph = DK.morph;
+    if (this.pendingBuild) this.buildMap();
+    if (!morph.FB) return;
+    const W = DK.W, H = DK.H, P = DK.P;
+    // 羊皮纸底：暖棕黄渐变 + 大块斑驳
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, '#ecdbb0'); g.addColorStop(1, '#dfc69c');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    for (let i = 0; i < 10; i++) {
+      const x = DKT.hash2(i, 3, 71) * W, y = DKT.hash2(i, 5, 72) * H;
+      ctx.fillStyle = i % 2 ? 'rgba(180,140,90,0.06)' : 'rgba(255,244,214,0.08)';
+      ctx.beginPath(); ctx.ellipse(x, y, 160 + DKT.hash2(i, 7, 73) * 240, 100 + DKT.hash2(i, 9, 74) * 150, 0, 0, 6.283); ctx.fill();
+    }
+    // 采样铺色：海（浅纸色）+ 海岸描边
+    const ST = 8;
+    for (let gy = 0; gy * ST < H; gy++)
+      for (let gx = 0; gx * ST < W; gx++) {
+        const x = gx * ST + ST / 2, y = gy * ST + ST / 2;
+        const sv = DKT.sampleArr(morph.FB.s, x, y);
+        const n = DKT.hash2(gx, gy, 76);
+        if (sv < -8) {
+          // 海：比陆地浅一点、偏灰的纸色
+          ctx.fillStyle = n < 0.5 ? 'rgba(206,196,168,0.85)' : 'rgba(214,205,180,0.85)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+          // 波纹线：稀疏的小波浪
+          if (n > 0.965) {
+            ctx.strokeStyle = 'rgba(110,120,110,0.5)';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(x - 6, y); ctx.quadraticCurveTo(x - 3, y - 3, x, y);
+            ctx.quadraticCurveTo(x + 3, y + 3, x + 6, y);
+            ctx.stroke();
+          }
+        } else if (sv < 5) {
+          // 海岸线：深棕描边（双线感：外深内浅）
+          ctx.fillStyle = 'rgba(122,92,56,0.85)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+        } else if (sv < 14) {
+          ctx.fillStyle = 'rgba(160,128,80,0.4)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+        }
+      }
+    // 装饰：山脉 / 树簇 / 草点
+    ctx.strokeStyle = '#7a5c3a'; ctx.lineWidth = 1.3; ctx.lineJoin = 'round';
+    for (const ms of this.hills)
+      for (const [x, y, r] of ms) {
+        ctx.beginPath();
+        ctx.moveTo(x - r, y); ctx.lineTo(x, y - r); ctx.lineTo(x + r, y);
+        ctx.stroke();
+      }
+    for (const t of this.treesD) {
+      ctx.fillStyle = 'rgba(140,150,96,0.8)';
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.r, 0, 6.283); ctx.fill();
+      ctx.fillStyle = 'rgba(110,124,76,0.8)';
+      ctx.beginPath(); ctx.arc(t.x + 1.5, t.y + 1.5, t.r * 0.55, 0, 6.283); ctx.fill();
+    }
+    ctx.fillStyle = 'rgba(122,92,56,0.55)';
+    for (const [x, y] of this.grass) {
+      ctx.fillRect(x, y, 1.6, 1.6);
+      ctx.fillRect(x + 3, y + 2, 1.6, 1.6);
+    }
+    // 道路：虚线贝塞尔
+    ctx.strokeStyle = 'rgba(122,92,56,0.75)';
+    ctx.lineWidth = 1.6;
+    ctx.setLineDash([6, 5]);
+    for (const r of this.roads) {
+      const pts = this.roadPts(r);
+      if (!pts) continue;
+      ctx.beginPath();
+      ctx.moveTo(pts[0], pts[1]);
+      ctx.quadraticCurveTo(pts[2], pts[3], pts[4], pts[5]);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    // 城镇：红顶小屋群 + 一座小塔
+    for (const t of this.towns) {
+      for (const [hx, hy, u] of t.houses) {
+        ctx.fillStyle = '#faf4e0';
+        ctx.fillRect(hx - 3.4, hy - 2.6, 6.8, 5.2);
+        ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 0.8;
+        ctx.strokeRect(hx - 3.4, hy - 2.6, 6.8, 5.2);
+        ctx.fillStyle = u < 0.5 ? '#a04030' : '#8a3528';
+        ctx.beginPath();
+        ctx.moveTo(hx - 4, hy - 2.6); ctx.lineTo(hx, hy - 6); ctx.lineTo(hx + 4, hy - 2.6);
+        ctx.closePath(); ctx.fill();
+      }
+      // 塔：最高的那栋
+      ctx.fillStyle = '#faf4e0'; ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 0.9;
+      ctx.fillRect(t.x - 3, t.y - 12, 6, 11); ctx.strokeRect(t.x - 3, t.y - 12, 6, 11);
+      ctx.fillStyle = '#a04030';
+      ctx.beginPath();
+      ctx.moveTo(t.x - 4, t.y - 12); ctx.lineTo(t.x, t.y - 16.5); ctx.lineTo(t.x + 4, t.y - 12);
+      ctx.closePath(); ctx.fill();
+    }
+    // 地名：手写衬线（大写 + 字距）
+    ctx.fillStyle = 'rgba(100,72,44,0.85)';
+    ctx.textAlign = 'center';
+    for (const l of this.labels) {
+      ctx.font = '600 15px Georgia, "Times New Roman", serif';
+      const chars = l.text.split('').join('\u2009');
+      ctx.fillText(chars, l.x, l.y);
+    }
+    ctx.textAlign = 'left';
+  },
+
+  /* ============================================================
+     动态层：马车（路上）→ 帆船（海上）
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    this.stepWagons(dt);
+    for (const w of this.wagons) this.drawWagon(ctx, w);
+    this.stepShips(dt);
+    for (const sp of this.ships) this.drawShip(ctx, sp);
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater(x, y) { return this.dk.morph.sample(x, y) < 4; },
+  iconsChanged() { this.buildMap(); this.syncShips(); this.syncWagons(); },
+  resized() { if (!this.dk) return; this.buildMap(); this.syncShips(); this.syncWagons(); },
+  seedChanged() { this.buildMap(); this.ships.length = 0; this.syncShips(); this.syncWagons(); },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildMap(); this.ships.length = 0; this.syncShips(); this.syncWagons(); }
+    if (changed.includes('ships')) this.syncShips();
+    if (changed.includes('wagons')) this.syncWagons();
+  },
+};
+
+/* ---------- 工具 ---------- */
+let TRSeed = 1;
+function TRnd() {
+  let a = TRSeed;
+  return () => {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function TRSeedSet(v) { TRSeed = v | 1; }
+function qbez(p, u) {
+  const v = 1 - u;
+  return [v * v * p[0] + 2 * v * u * p[2] + u * u * p[4], v * v * p[1] + 2 * v * u * p[3] + u * u * p[5]];
+}
+function qtan(p, u) {
+  const v = 1 - u;
+  return [2 * v * (p[2] - p[0]) + 2 * u * (p[4] - p[2]), 2 * v * (p[3] - p[1]) + 2 * u * (p[5] - p[3])];
+}
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

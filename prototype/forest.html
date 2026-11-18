@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 森林</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #b9cc80; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 森林主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/forest.webp）：浅黄绿的草底，满屏水粉风卡通树——
+  松树（层叠三角）和阔叶树（圆冠带右下暗面）混着长，深棕短干，几乎不透明、前后遮挡
+  - 图标在林间的空地上：融球场围绕图标圈出空地；树按固定格子撒点，树心落在空地外的才留下
+  - 树的可见度跟着场走：图标挪动时空地边缘的树平滑退让 / 长回来
+  - 分层与粉色森林一致：离空地远、两种布局下都不动的树画进静态层；
+    空地边缘一圈每帧动态画（带风摇）；水粉树不透明，空地边缘的树盖住更远的树，前后关系正确
+  - 小鸟：蓝灰白的小鸟栖在树顶，偶尔扇翅、飞去旁边的树
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '森林 · 原型',
+  // 默认值要和 themes.json 里森林的 default 保持一致
+  params: { sigma: 90, wind: 1, birds: 3 },
+  sliders: [
+    { key: 'sigma', label: '空地大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'wind',  label: '风',       min: 0,  max: 3,   step: 0.05, fmt: v => '×' + v.toFixed(2) },
+    { key: 'birds', label: '小鸟',     min: 0,  max: 8,   step: 1, fmt: v => v + ' 只' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 30);
+    this.ft = 0;
+    this.edgeDirty = true;
+    this.treesStatic = []; this.treesEdge = []; this.perches = [];
+    this.pendingBuild = true;
+    this.buildTrees();
+    this.birds = [];
+    this.syncBirds();
+  },
+
+  /* ============================================================
+     树：固定格子撒点（hash 带种子）；松树（层叠三角）+ 阔叶树（圆冠+暗面）混种
+     ============================================================ */
+  buildTrees() {
+    const W = this.dk.W, H = this.dk.H, morph = this.dk.morph;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const G = 44, BAND = 115, EDGE_MAX = 260;
+    const all = [];
+    for (let gy = -1; gy * G < H + G; gy++) for (let gx = -1; gx * G < W + G; gx++) {
+      const h = i => DKT.hash2(gx, gy, 40 + i);
+      if (h(0) < 0.15) continue;                 // 留一点草地的空隙
+      const t = {
+        x: (gx + 0.12 + h(1) * 0.76) * G,
+        y: (gy + 0.12 + h(2) * 0.76) * G,
+        r: 18 + h(3) * h(3) * 36,                // 小树多、大树少
+        pine: h(4) < 0.55,                       // 松树多一点（缩略图里松树为主）
+      };
+      t.rIn = t.r * 0.92 + 8;
+      if (t.pine) {
+        const cs = PINE[Math.floor(h(5) * PINE.length)];
+        t.layers = cs;                             // 三角层色（底层暗、顶层亮）
+        t.n = 3 + Math.floor(h(6) * 2);            // 3~4 层
+      } else {
+        const cs = BROAD[Math.floor(h(5) * BROAD.length)];
+        t.cLit = cs[0]; t.cMid = cs[1]; t.cDark = cs[2];
+        t.twin = h(6) < 0.4;                       // 少数阔叶树是双圆冠
+      }
+      t.trunkH = t.r * (0.35 + h(7) * 0.25);       // 深棕短干
+      t.phase = h(9) * 6.283;
+      all.push(t);
+    }
+    // 归类：旧场和新场里都离空地够远的树画进静态层；其余每帧动态画
+    const sA = morph.FA.s, sB = morph.FB.s;
+    const dist = (s, t) => DKT.sampleArr(s, t.x, t.y);
+    for (const t of all) {
+      const kA = (dist(sA, t) - t.rIn) / BAND, kB = (dist(sB, t) - t.rIn) / BAND;
+      t.static = Math.min(kA, kB) > 1;
+    }
+    let edge = all.filter(t => !t.static);
+    if (edge.length > EDGE_MAX) {
+      edge.sort((a, b) => dist(sB, a) - dist(sB, b));
+      for (const t of edge.slice(EDGE_MAX)) t.static = true;
+      edge = edge.slice(0, EDGE_MAX);
+    }
+    this.treesStatic = all.filter(t => t.static);
+    this.treesEdge = edge;
+    // 栖木：松树的顶点（t.y - r*0.6 - 0.72r）/ 阔叶树的冠顶
+    this.perches = all.map(t => t.pine ? [t.x, t.y - t.r * 1.32] : [t.x, t.y - t.r * (t.twin ? 1.22 : 1.3)]);
+    this.dk.invalidate();
+  },
+
+  /* ============================================================
+     小鸟：蓝灰身子、白肚（缩略图左下的那种）
+     ============================================================ */
+  syncBirds() {
+    const want = Math.max(0, Math.min(8, Math.round(this.dk.P.birds)));
+    while (this.birds.length > want) this.birds.pop();
+    while (this.birds.length < want) {
+      const perch = Math.floor(Math.random() * Math.max(1, this.perches.length));
+      const [x, y] = this.perches[perch] || [this.dk.W / 2, this.dk.H / 2];
+      this.birds.push({ x, y, perch, state: 'perch', flapT: 3 + Math.random() * 9, flap: 0, to: null, t: 0, from: null, blue: Math.random() < 0.5 });
+    }
+  },
+  stepBirds(dt) {
+    const perches = this.perches;
+    for (const b of this.birds) {
+      if (b.state === 'perch') {
+        b.flap = Math.max(0, b.flap - dt * 2.2);
+        if ((b.flapT -= dt) <= 0) {
+          b.flapT = 4 + Math.random() * 10;
+          if (Math.random() < 0.4) b.flap = 1;
+          else {
+            const cand = [];
+            for (let i = 0; i < perches.length; i++) {
+              if (i === b.perch) continue;
+              const d = Math.hypot(perches[i][0] - b.x, perches[i][1] - b.y);
+              if (d > 40 && d < 320) cand.push(i);
+            }
+            if (cand.length) {
+              b.state = 'fly'; b.t = 0; b.from = [b.x, b.y];
+              b.to = perches[cand[Math.floor(Math.random() * cand.length)]];
+            }
+          }
+        }
+      } else {
+        b.t += dt / 1.15;
+        if (b.t >= 1) { b.state = 'perch'; b.perch = this.nearestPerch(b.x, b.y); b.flapT = 4 + Math.random() * 8; }
+        else {
+          const e = b.t < 0.5 ? 2 * b.t * b.t : 1 - Math.pow(-2 * b.t + 2, 2) / 2;
+          b.x = b.from[0] + (b.to[0] - b.from[0]) * e;
+          b.y = b.from[1] + (b.to[1] - b.from[1]) * e - Math.sin(Math.PI * b.t) * 52;
+        }
+      }
+    }
+  },
+  nearestPerch(x, y) {
+    let best = 0, bd = 1e9;
+    this.perches.forEach(([px, py], i) => { const d = Math.hypot(px - x, py - y); if (d < bd) { bd = d; best = i; } });
+    return best;
+  },
+
+  /* ============================================================
+     静态层：草底 + 草笔触 + 远处的树
+     ============================================================ */
+  drawStatic(ctx, s) {
+    if (this.pendingBuild) this.buildTrees();
+    const g = ctx.createLinearGradient(0, 0, this.dk.W, this.dk.H);
+    g.addColorStop(0, '#c8d88c'); g.addColorStop(1, '#b4c878');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, this.dk.W, this.dk.H);
+    // 草笔触：稀疏的浅/深短横线，空地上也画（树是让开空地的，草不让）
+    for (let i = 0; i < 700; i++) {
+      const x = DKT.hash2(i, 3, 81) * this.dk.W, y = DKT.hash2(i, 5, 82) * this.dk.H;
+      const len = 2.5 + DKT.hash2(i, 7, 83) * 4;
+      ctx.strokeStyle = i % 3 ? 'rgba(238,244,196,0.5)' : 'rgba(150,172,96,0.45)';
+      ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + len, y + (DKT.hash2(i, 9, 84) - 0.5) * 1.6); ctx.stroke();
+    }
+    // 按 y 排序画（靠下的树在前）
+    const sorted = this.treesStatic.slice().sort((a, b) => a.y - b.y);
+    for (const t of sorted) this.drawTree(ctx, t, 1, 0);
+  },
+
+  /* ---------- 一棵树（k：离空地边的可见度；sway：风摇的偏移） ---------- */
+  drawTree(ctx, t, k, sway) {
+    if (k < 0.04) return;
+    const dx = sway * k;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, 0.12 + k);       // 长出来的过程有一点点透明
+    if (t.pine) this.drawPine(ctx, t, k, dx);
+    else this.drawBroad(ctx, t, k, dx);
+    ctx.restore();
+  },
+  drawPine(ctx, t, k, dx) {
+    const r = t.r * k, n = t.n;
+    // 干：深棕短干
+    ctx.fillStyle = '#5a463f';
+    ctx.fillRect(t.x - r * 0.09, t.y - r * 0.1, r * 0.18, t.trunkH * k);
+    // 层叠三角：底层最宽最暗，往上更小更亮；顶层摆得多
+    for (let i = 0; i < n; i++) {
+      const f = i / Math.max(1, n - 1);            // 0 底 → 1 顶
+      const halfW = r * (0.72 - f * 0.4);
+      const layerH = r * 0.72;
+      const cy = t.y - r * 0.1 - f * r * 0.5;      // 层底边的 y
+      const lx = dx * (0.25 + f * 0.75);           // 顶层摆动最大
+      ctx.fillStyle = t.layers[Math.min(i, t.layers.length - 1)];   // 底层暗、顶层亮
+      ctx.beginPath();
+      ctx.moveTo(t.x + lx, cy - layerH);           // 顶点
+      ctx.lineTo(t.x - halfW + lx * 0.35, cy);
+      ctx.lineTo(t.x + halfW + lx * 0.35, cy);
+      ctx.closePath();
+      ctx.fill();
+    }
+  },
+  drawBroad(ctx, t, k, dx) {
+    const r = t.r * k;
+    // 干：深棕短干
+    ctx.fillStyle = '#5a463f';
+    ctx.fillRect(t.x - r * 0.08, t.y - r * 0.15, r * 0.16, t.trunkH * k + r * 0.3);
+    // 冠：亮色圆 → clip 里叠右下偏移的暗色圆（暗面在右下）
+    const crown = (cx, cy, cr, main, dark) => {
+      ctx.fillStyle = main;
+      ctx.beginPath(); ctx.arc(cx + dx, cy, cr, 0, 6.283); ctx.fill();
+      ctx.save();
+      ctx.beginPath(); ctx.arc(cx + dx, cy, cr, 0, 6.283); ctx.clip();
+      ctx.fillStyle = dark;
+      ctx.beginPath(); ctx.arc(cx + dx + cr * 0.4, cy + cr * 0.34, cr, 0, 6.283); ctx.fill();
+      ctx.restore();
+    };
+    if (t.twin) {
+      crown(t.x - r * 0.42, t.y - r * 0.18, r * 0.62, t.cMid, t.cDark);
+      crown(t.x + r * 0.3, t.y - r * 0.5, r * 0.72, t.cLit, t.cDark);
+    } else {
+      crown(t.x, t.y - r * 0.3, r * 0.92, t.cMid, t.cDark);
+      // 冠顶再来一小团亮色，树形更鼓
+      ctx.fillStyle = t.cLit;
+      ctx.beginPath(); ctx.arc(t.x + dx * 0.8, t.y - r * 0.62, r * 0.5, 0, 6.283); ctx.fill();
+    }
+  },
+
+  /* ============================================================
+     动态层：空地边缘的树（风摇 / 过渡生长）+ 小鸟
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    this.ft += dt;
+    const DK = this.dk, morph = DK.morph, P = DK.P;
+    const BAND = 115;
+    const need = P.wind > 0 || morph.morphing || this.edgeDirty;
+    if (need) {
+      const edge = this.treesEdge.slice().sort((a, b) => a.y - b.y);
+      for (const t of edge) {
+        const k = Math.min(Math.max((morph.sample(t.x, t.y) - t.rIn) / BAND, 0), 1);
+        if (k <= 0.02) continue;
+        const sway = P.wind > 0 ? Math.sin(this.ft * 0.85 + t.phase) * P.wind * 2.3 : 0;
+        this.drawTree(ctx, t, k, sway);
+      }
+      this.edgeDirty = morph.morphing || P.wind > 0;
+    }
+    // 小鸟
+    this.stepBirds(dt);
+    for (const b of this.birds) {
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      const body = b.blue ? '#7a9ab0' : '#8aa8b8', belly = '#f4f8f4', wing = b.blue ? '#4a6a84' : '#5a7a92';
+      ctx.fillStyle = belly;
+      ctx.beginPath(); ctx.ellipse(0, 0.8, 4.4, 3.2, 0, 0, 6.283); ctx.fill();       // 白肚
+      ctx.fillStyle = body;
+      ctx.beginPath(); ctx.ellipse(0, -0.6, 4.8, 3.4, 0, Math.PI, 6.283); ctx.fill();// 蓝灰背
+      ctx.beginPath(); ctx.arc(4.2, -2.6, 2, 0, 6.283); ctx.fill();                  // 头
+      ctx.strokeStyle = '#3a3230'; ctx.lineWidth = 1; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(6, -2.8); ctx.lineTo(7.8, -2.3); ctx.stroke();     // 喙
+      ctx.beginPath(); ctx.moveTo(-4.6, -0.4); ctx.lineTo(-8.6, -2); ctx.stroke();   // 尾
+      ctx.fillStyle = wing;
+      if (b.state === 'perch') {
+        const wf = b.flap > 0 ? Math.sin(this.ft * 26) * 3.2 : 0;
+        ctx.beginPath(); ctx.ellipse(-0.5, -1 - wf * 0.4, 3.4, 1.9, -0.5 - wf * 0.08, 0, 6.283); ctx.fill();
+        ctx.strokeStyle = '#5a463f';
+        ctx.beginPath(); ctx.moveTo(-0.6, 3.4); ctx.lineTo(-0.6, 5.6); ctx.stroke(); // 腿
+        ctx.beginPath(); ctx.moveTo(1.6, 3.4); ctx.lineTo(1.6, 5.6); ctx.stroke();
+      } else {
+        const wf = Math.sin(this.ft * 15) * 3.6;
+        ctx.beginPath(); ctx.ellipse(0.5, -2 - wf, 4.2, 1.7, -0.55, 0, 6.283); ctx.fill();
+      }
+      ctx.restore();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return false; },
+  iconsChanged() {
+    this.buildTrees();
+    this.edgeDirty = true;
+    this.syncBirds();
+  },
+  resized() {
+    if (!this.dk) return;
+    this.buildTrees(); this.edgeDirty = true; this.syncBirds();
+  },
+  seedChanged() {
+    this.buildTrees();
+    this.edgeDirty = true;
+    this.birds.length = 0; this.syncBirds();
+  },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildTrees(); this.edgeDirty = true; this.syncBirds(); }
+    if (changed.includes('birds')) this.syncBirds();
+    if (changed.includes('wind')) this.edgeDirty = true;
+  },
+};
+
+/* ---------- 水粉配色（取自缩略图）：每组的层色 / 亮中暗 ---------- */
+const PINE = [
+  ['#1f5a3a', '#2d6a45', '#4f8f5a'],   // 深绿松
+  ['#2a5a48', '#3c7f5a', '#6aa869'],   // 蓝绿松
+  ['#26505c', '#3c6f7c', '#6aa8a0'],   // 青蓝松
+  ['#1e4a38', '#3f7f50', '#6aa85e'],   // 墨绿松
+  ['#2d6a45', '#4f8f5a', '#8ab86a'],   // 亮绿松
+];
+const BROAD = [
+  ['#6aa85e', '#4f8f5a', '#2d5a40'],   // 标准绿
+  ['#8ab86a', '#6aa869', '#3c6f4c'],   // 亮黄绿
+  ['#5a9a6a', '#3c7f5a', '#26503a'],   // 深绿
+  ['#a8b84e', '#8a9a3a', '#5a7030'],   // 黄绿
+  ['#5a9aa8', '#3c6f7c', '#265058'],   // 蓝绿
+];
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 天空</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #4a9ad4; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 天空主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/sky.webp）：干净的中蓝天空，圆鼓鼓的卡通云（白云 + 底部浅蓝灰的一层），
+  图标坐在云上；红色双翼机拖着白色虚线尾迹横穿
+  - 时段：跟随时间（6 点破晓 / 7 点白天 / 17 点半傍晚 / 19 点晚上）或手动指定；
+    天空色、云色、月亮星星都跟着变
+  - 白天：鸟；夜晚：月亮（带月光晕）和星星（调大有带十字闪光的亮星）；傍晚都有
+  - 云：融球场围绕图标的云团 + 天上整朵飘的云（和草地同一套云模块）
+  - 飞机：从右往左横穿，白色虚线尾迹拉到画面边缘；偶尔 / 频繁可调
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '天空 · 原型',
+  // 默认值要和 themes.json 里天空的 default 保持一致
+  params: { time: 0, sigma: 85, cover: 0.35, flow: 1, birds: 3, plane: 1, moon: 1, stars: 1 },
+  sliders: [
+    { key: 'sigma', label: '云团大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'cover', label: '天上的云', min: 0, max: 1, step: 0.01, fmt: v => Math.round(v * 100) + '%' },
+    { key: 'flow',  label: '流动速度', min: 0, max: 3, step: 0.05, fmt: v => '×' + v.toFixed(2) },
+    { key: 'birds', label: '鸟',       min: 0, max: 8, step: 1, fmt: v => v + ' 只' },
+    { key: 'stars', label: '星星大小', min: 0, max: 3, step: 0.5, fmt: v => '×' + v.toFixed(1) },
+  ],
+  fieldKeys: ['sigma'],
+
+  /* ---------- 三种时段的氛围（天空渐变 / 云色 / 星月透明度 / 傍晚光斑） ---------- */
+  ATMO: [
+    null,                                          // 0 = 跟随时间，运行时解析
+    { top: '#3385cc', bot: '#80bfe6', cloud: '#fdfeff', cloudSh: '#dce8f0', lit: '#ffffff', stars: 0, moon: 0, glow: null },       // 白天
+    { top: '#4a5a98', bot: '#e8a060', cloud: '#f8e4d0', cloudSh: '#c8a8a8', lit: '#ffe8d0', stars: 0.35, moon: 0, glow: [0.5, 0.95, 'rgba(255,190,120,0.5)'] },  // 傍晚
+    { top: '#141f42', bot: '#2a3a72', cloud: '#a8b4d8', cloudSh: '#8894b8', lit: '#d0daee', stars: 1, moon: 1, glow: null },      // 晚上
+  ],
+  resolveAtmo() {
+    const P = this.dk.P;
+    let idx = P.time | 0;
+    if (idx === 0) {                               // 跟随时钟
+      const d = new Date(), m = d.getHours() * 60 + d.getMinutes();
+      idx = m < 360 ? 3 : m < 420 ? 2 : m < 1050 ? 1 : m < 1140 ? 2 : 3;
+    }
+    return this.ATMO[idx] || this.ATMO[1];
+  },
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 26);
+    this.mass = DK2.createCloudMass({ morph: DK.morph, getEdge: () => 8, R: 92 });
+    this.sky = DK2.createFreeClouds({ getCover: () => P.cover, getFlow: () => P.flow, getH: () => DK.TASKBAR });
+    this.fts = 0;
+    this.ft = 0;
+    // 星星：位置固定（种子随 resize 重撒一次），闪烁在动态层
+    this.makeStars();
+    this.birds = [];
+    this.syncBirds();
+    // 飞机：{active, x, y}；下次出现的时间
+    this.plane = { active: false, x: 0, y: 0, next: 6 };
+  },
+
+  makeStars() {
+    const DK = this.dk;
+    this.stars = [];
+    const n = 110;
+    for (let i = 0; i < n; i++) {
+      this.stars.push({
+        x: DKT.hash2(i, 3, 61) * DK.W,
+        y: DKT.hash2(i, 5, 62) * (DK.H - DK.TASKBAR),
+        r: 0.7 + DKT.hash2(i, 7, 63) * 1.5,
+        ph: DKT.hash2(i, 9, 64) * 6.283,
+        cross: DKT.hash2(i, 11, 65) > 0.86,        // 少量大星带十字闪光
+      });
+    }
+  },
+
+  syncBirds() {
+    const DK = this.dk;
+    const night = this.resolveAtmo() === this.ATMO[3];
+    const want = night ? 0 : Math.max(0, Math.min(8, DK.P.birds | 0));
+    while (this.birds.length > want) this.birds.pop();
+    while (this.birds.length < want)
+      this.birds.push({
+        x: Math.random() * DK.W, y: Math.random() * (DK.H - DK.TASKBAR) * 0.7,
+        h: Math.random() * 6.283, v: 40 + Math.random() * 22,
+        mode: 0, modeT: 2 + Math.random() * 4, ph: Math.random() * 6.283, wander: Math.random() * 100,
+      });
+  },
+
+  stepBirds(dt) {
+    const DK = this.dk, H2 = DK.H - DK.TASKBAR, m = 80;
+    this.birds.forEach((b, i) => {
+      if ((b.modeT -= dt) <= 0) {
+        b.mode = Math.random() < 0.4 ? (Math.random() < 0.5 ? -1 : 1) : 0;
+        b.modeT = b.mode ? 3 + Math.random() * 5 : 2 + Math.random() * 4;
+      }
+      b.wander += dt * 0.4;
+      if (b.x < -m || b.x > DK.W + m || b.y < -m || b.y > H2 + m)
+        b.h = DK2.turnToward(b.h, Math.atan2(H2 / 2 - b.y, DK.W / 2 - b.x), 1.3 * dt);
+      else b.h += (b.mode * 0.5 + (DKT.vnoise(b.wander, i * 7.3) - 0.5) * 0.9) * dt;
+      if (Math.cos(b.ph) < 0.97 || Math.random() < 0.003) b.ph = (b.ph + dt * 9) % 6.283;
+      b.x += Math.cos(b.h) * b.v * dt; b.y += Math.sin(b.h) * b.v * dt;
+    });
+  },
+  // 远处的小鸟：两条弧线，扇翅
+  drawBird(ctx, b) {
+    const s = Math.sin(b.ph) * 3.2;
+    ctx.save();
+    ctx.translate(b.x, b.y); ctx.rotate(b.h + Math.PI / 2);
+    ctx.strokeStyle = this.resolveAtmo() === this.ATMO[2] ? 'rgba(60,40,60,0.85)' : 'rgba(40,44,54,0.85)';
+    ctx.lineWidth = 1.8; ctx.lineCap = 'round';
+    ctx.beginPath();
+    ctx.moveTo(-5.5, 2.5); ctx.quadraticCurveTo(-2.4, -2.4 - s, 0, 0.4);
+    ctx.quadraticCurveTo(2.4, -2.4 - s, 5.5, 2.5);
+    ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ============================================================
+     静态层：天空渐变（随时段）+ 傍晚的低垂光斑
+     ============================================================ */
+  drawStatic(ctx, s) {
+    const DK = this.dk, a = this.resolveAtmo();
+    const g = ctx.createLinearGradient(0, 0, 0, DK.H);
+    g.addColorStop(0, a.top); g.addColorStop(1, a.bot);
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, DK.W, DK.H);
+    // 傍晚：地平线附近一团暖橙的光
+    if (a.glow) {
+      const rg = ctx.createRadialGradient(DK.W * a.glow[0], DK.H * a.glow[1], 0, DK.W * a.glow[0], DK.H * a.glow[1], DK.W * 0.5);
+      rg.addColorStop(0, a.glow[2]);
+      rg.addColorStop(1, 'rgba(255,190,120,0)');
+      ctx.fillStyle = rg;
+      ctx.fillRect(0, 0, DK.W, DK.H);
+    }
+  },
+
+  /* ============================================================
+     动态层：星星 → 云（图标云团 + 天上的云）→ 月亮 → 飞机 → 鸟
+     月亮画在云的后面一层：夜里要看得见月亮，不按真实的遮挡来
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    const DK = this.dk;
+    this.ft += dt;
+    this.fts += dt * DK.P.flow;
+    const a = this.resolveAtmo(), P = DK.P;
+    // 星星：亮度闪烁；大星带十字闪光（傍晚只有淡淡的星）
+    if (a.stars > 0 && P.stars > 0) {
+      const n = Math.min(this.stars.length, Math.round(this.stars.length * P.stars / 1.5));
+      ctx.fillStyle = '#fdfcf4';
+      for (let i = 0; i < n; i++) {
+        const st = this.stars[i];
+        const tw = 0.45 + 0.55 * Math.sin(this.ft * 1.4 + st.ph);
+        const al = a.stars * (0.35 + 0.65 * tw);
+        ctx.globalAlpha = al;
+        ctx.beginPath(); ctx.arc(st.x, st.y, st.r * (0.8 + 0.25 * tw), 0, 6.283); ctx.fill();
+        if (st.cross && tw > 0.7) {                    // 大星的十字闪光（最亮时才出现）
+          ctx.strokeStyle = 'rgba(253,252,244,0.8)'; ctx.lineWidth = 1;
+          const L = st.r * 4.5 * tw;
+          ctx.beginPath();
+          ctx.moveTo(st.x - L, st.y); ctx.lineTo(st.x + L, st.y);
+          ctx.moveTo(st.x, st.y - L); ctx.lineTo(st.x, st.y + L);
+          ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = 1;
+    }
+    // 云：先画天上的云（远），再画图标坐的云（近、更白）
+    this.sky.step(dt, this.fts, DK.W, DK.H);
+    const CLOUD = { body: a.cloud, shade: a.cloudSh, edge: a.lit };
+    for (const c of this.sky.list) DK2.paintCloud(ctx, DK2.expandCloud(c, this.fts), {}, CLOUD);
+    const mass = this.mass.update(now / 1000, this.fts, DK.W, DK.H);
+    DK2.paintCloud(ctx, mass, {}, { body: a.cloud, shade: a.cloudSh, edge: a.lit, litW: 14 });
+    // 月亮：满月 + 陨石坑 + 大范围月光晕（画在云上，保证夜里看得见）
+    if (a.moon === 1 && P.moon === 1) {
+      const mx = DK.W * 0.78, my = DK.H * 0.2, r = 44;
+      const halo = ctx.createRadialGradient(mx, my, r * 0.6, mx, my, r * 3.4);
+      halo.addColorStop(0, 'rgba(240,240,220,0.22)');
+      halo.addColorStop(1, 'rgba(240,240,220,0)');
+      ctx.fillStyle = halo;
+      ctx.fillRect(mx - r * 3.4, my - r * 3.4, r * 6.8, r * 6.8);
+      ctx.fillStyle = '#f6f2e4';
+      ctx.beginPath(); ctx.arc(mx, my, r, 0, 6.283); ctx.fill();
+      ctx.fillStyle = 'rgba(190,186,170,0.5)';
+      ctx.beginPath(); ctx.arc(mx - r * 0.3, my - r * 0.18, r * 0.16, 0, 6.283); ctx.fill();
+      ctx.beginPath(); ctx.arc(mx + r * 0.22, my + r * 0.3, r * 0.12, 0, 6.283); ctx.fill();
+      ctx.beginPath(); ctx.arc(mx + r * 0.32, my - r * 0.34, r * 0.09, 0, 6.283); ctx.fill();
+    }
+    // 飞机：从右往左横穿，白色虚线尾迹拉到画面边缘
+    this.stepPlane(dt, ctx);
+    // 鸟（晚上不飞）
+    this.stepBirds(dt);
+    for (const b of this.birds) this.drawBird(ctx, b);
+  },
+  stepPlane(dt, ctx) {
+    const DK = this.dk, P = DK.P, pl = this.plane;
+    if (!pl.active) {
+      if (P.plane === 0) return;
+      pl.next -= dt;
+      if (pl.next <= 0) {
+        pl.active = true;
+        pl.x = DK.W + 40;
+        pl.y = 60 + Math.random() * (DK.H - DK.TASKBAR) * 0.4;
+        pl.next = P.plane === 2 ? 12 + Math.random() * 8 : 30 + Math.random() * 20;
+      }
+      return;
+    }
+    pl.x -= 190 * dt;
+    if (pl.x < -70) { pl.active = false; return; }
+    const { x, y } = pl;
+    // 尾迹：机尾往右一路虚线到画面边缘
+    ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+    ctx.lineWidth = 2.6;
+    ctx.setLineDash([10, 8]);
+    ctx.beginPath(); ctx.moveTo(x + 26, y + 2); ctx.lineTo(DK.W + 20, y + 2); ctx.stroke();
+    ctx.setLineDash([]);
+    // 双翼机（朝左飞）：红色机身 + 上下两层白翼 + 尾翼
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = '#d85a4a';
+    ctx.beginPath(); ctx.ellipse(0, 0, 17, 6, 0, 0, 6.283); ctx.fill();           // 机身
+    ctx.fillStyle = '#fbfdff'; ctx.strokeStyle = 'rgba(90,70,70,0.5)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.ellipse(-1, -7, 12, 2.6, 0, 0, 6.283); ctx.fill(); ctx.stroke();  // 上翼
+    ctx.beginPath(); ctx.ellipse(1, 7, 12, 2.6, 0, 0, 6.283); ctx.fill(); ctx.stroke();    // 下翼
+    ctx.beginPath(); ctx.ellipse(0, 0, 3, 8.4, 0, 0, 6.283); ctx.fill(); ctx.stroke();     // 翼柱
+    ctx.fillStyle = '#d85a4a';
+    ctx.beginPath();                                                              // 尾翼
+    ctx.moveTo(14, -2); ctx.lineTo(22, -7); ctx.lineTo(23, -1); ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = '#e8e4e0'; ctx.lineWidth = 2;                                // 螺旋桨
+    ctx.beginPath(); ctx.moveTo(-18, -5); ctx.lineTo(-18, 5); ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return false; },
+  iconsChanged() {},
+  resized() { if (!this.dk) return; this.makeStars(); this.sky.clear(); },
+  seedChanged() { this.makeStars(); this.sky.clear(); },
+  onParams(changed) {
+    if (changed.includes('time')) { this.dk.invalidate(); this.syncBirds(); }
+    if (changed.includes('birds')) this.syncBirds();
+    if (changed.includes('plane') && this.dk.P.plane === 0) this.plane.active = false;
+  },
+};
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

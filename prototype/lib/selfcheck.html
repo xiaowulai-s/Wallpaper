@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 公共模块自检</title>
+<link rel="stylesheet" href="ui.css">
+<style> html, body { background: #a2c06a; } </style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!-- 自检场景：融球场围绕图标的云团 + 天上飘的云 + 一群绕场游的小鱼。
+     用于验证 lib/* 的地形场、静态缓存、主循环、面板、拖拽与 share.js 的兼容性，不随主题发布。 -->
+<script src="terrain.js"></script>
+<script src="kit-2d.js"></script>
+<script src="host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '公共模块自检',
+  params: { sigma: 90, warp: 30, flow: 1, fish: 24 },
+  sliders: [
+    { key: 'sigma', label: '云团大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'warp', label: '云团曲折', min: 0, max: 80, step: 1, fmt: v => v + '' },
+    { key: 'flow', label: '流动速度', min: 0, max: 3, step: 0.05, fmt: v => '×' + v.toFixed(2) },
+    { key: 'fish', label: '小鱼', min: 0, max: 60, step: 1, fmt: v => v + ' 条' },
+  ],
+  fieldKeys: ['sigma', 'warp'],
+  init(DK) {
+    const P = DK.P;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => P.warp);
+    this.mass = DK2.createCloudMass({ morph: DK.morph, getEdge: () => 0 });
+    this.sky = DK2.createFreeClouds({ getCover: () => 0.3, getFlow: () => P.flow, getH: () => DK.TASKBAR });
+    this.school = DK2.createSchool({
+      n: P.fish, morph: DK.morph,
+      make: (i, rnd) => {
+        const a = rnd() * 6.28;
+        return { x: DK.W * rnd(), y: DK.H * rnd(), h: a, v: 1, ph: rnd() * 6.28, k: rnd() };
+      },
+      speed: [16, 30], sep: 22, coh: 110, safe: 40,
+      bounds: () => [DK.W, DK.H - DK.TASKBAR, 40],
+      attractor: null,
+    });
+    this.ft = 0;
+  },
+  isWater(x, y) { return DK.morph.sample(x, y) > 4; },
+  drawStatic(ctx, s) {
+    // 草地底色：两块水彩晕染
+    const g = ctx.createLinearGradient(0, 0, DK.W, DK.H);
+    g.addColorStop(0, '#c3d684'); g.addColorStop(1, '#a2c06a');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, DK.W, DK.H);
+    // 云影：整团云往右下偏移，压成深绿
+    const circles = this.mass.update(performance.now() / 1000, this.ft, DK.W, DK.H)
+      .map((v, i) => i % 4 === 0 ? v + 115 : i % 4 === 1 ? v + 156 : v);
+    ctx.save();
+    ctx.globalAlpha = 0.55;
+    DK2.paintCloud(ctx, circles, {}, { body: '#4f7030', edge: '#4f7030', shade: '#4f7030' });
+    ctx.restore();
+  },
+  frame(now, dt, ctx, s) {
+    this.ft += dt * DK.P.flow;
+    this.sky.step(dt, this.ft, DK.W, DK.H);
+    this.school.setCount(DK.P.fish);
+    this.school.step(dt);
+    // 天上的云
+    for (const c of this.sky.list) DK2.paintCloud(ctx, DK2.expandCloud(c, this.ft), {});
+    // 图标周围的云团
+    DK2.paintCloud(ctx, this.mass.update(now / 1000, this.ft, DK.W, DK.H), {});
+    // 小鱼：橙色的水滴形，按朝向转身
+    ctx.save();
+    for (const f of this.school.fish) {
+      ctx.save();
+      ctx.translate(f.x, f.y); ctx.rotate(f.h);
+      ctx.fillStyle = f.k < 0.3 ? '#e8843e' : '#e8b03e';
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 7, 3.4, 0, 0, 6.2832);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(-6, 0); ctx.lineTo(-11, -3.4 + Math.sin(f.ph) * 1.6); ctx.lineTo(-11, 3.4 + Math.sin(f.ph) * 1.6);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+    }
+    ctx.restore();
+    // 涟漪：细白圈
+    for (const r of DK.ripples) {
+      const age = (now - r.t0) / 1000;
+      if (age > 3) continue;
+      ctx.strokeStyle = 'rgba(255,255,255,' + (0.7 * (1 - age / 3)) + ')';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(r.x, r.y, age * 80 * r.str, 0, 6.2832); ctx.stroke();
+    }
+  },
+  onParams(changed) { this.invalidate(); },
+};
+
+/* 自检断言：模块都在、场能算、缓存能命中。控制台跑 __selfcheck() */
+window.__selfcheck = function () {
+  const out = [];
+  const ok = (name, cond) => out.push((cond ? 'PASS' : 'FAIL') + ' ' + name);
+  ok('modules', !!(window.DKT && window.DK2 && window.DKHost && window.DK));
+  ok('morph-field', DK.morph && DK.morph.FB && DK.morph.FB.s.length > 0);
+  ok('morph-sample', Math.abs(DK.morph.sample(innerWidth / 2, innerHeight / 2)) < 1e6);
+  ok('cloud-mass', THEME.mass.update(performance.now() / 1000, 0, DK.W, DK.H).length > 0 || DK.icons.length === 0);
+  ok('free-clouds', THEME.sky.list.length >= 0);
+  ok('school', THEME.school.fish.length === DK.P.fish);
+  ok('static-cache', window.cacheOK === true);
+  ok('share-globals', [window.cv, window.draw, window.icons, window.W, window.H, window.WALL, window.TASKBAR].every(v => v !== undefined) &&
+    typeof window.paused === 'boolean' && typeof window.frameN === 'number' && typeof window.commit === 'function');
+  ok('wallpaperSnapshot', typeof window.wallpaperSnapshot === 'function');
+  return out.join('\n');
+};
+</script>
+<script src="scene-kit.js"></script>
+<script src="../share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

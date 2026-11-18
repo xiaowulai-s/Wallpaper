@@ -1,0 +1,382 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 航海地图</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #f0e0b8; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 航海地图主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/nautical chart.webp + 老地图的陆地画法）：羊皮纸海图——
+  图标聚成一座岛屿（岸线描边），海洋布满细密波纹，右上一枚罗盘玫瑰；
+  沿岸的港口小镇和灯塔，弯曲的虚线航道穿过海面，墨线帆船随波起伏，
+  深海处蹲着一只墨线海怪（圆头卷触手）
+  - 地形：融球场 s<0 是岛屿陆地（图标聚在上面）、s>0 是海洋——和老地图相反
+  - 动态：帆船起伏巡航、海怪触手轻摆、灯塔光束慢转
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '航海地图 · 原型',
+  // 默认值要和 themes.json 里航海地图的 default 保持一致
+  params: { sigma: 90, ships: 3 },
+  sliders: [
+    { key: 'sigma', label: '陆地大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'ships', label: '帆船',     min: 0,  max: 6,   step: 1, fmt: v => v + ' 艘' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 30);
+    this.ships = [];
+    this.pendingBuild = true;
+    this.buildChart();
+    this.syncShips();
+  },
+
+  /* ============================================================
+     海图：沿岸港口小镇 / 灯塔 / 航道 / 罗盘（帆船在动态层）
+     ============================================================ */
+  buildChart() {
+    const DK = this.dk, morph = DK.morph;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const W = DK.W, H = DK.H;
+    TRSeed = DKT.getSeed() | 1;
+    const rnd = TRnd();
+    const sB = morph.FB.s;
+    const sea = (x, y) => DKT.sampleArr(sB, x, y);
+    // 港口小镇：贴着海岸（陆地边缘）的点
+    this.ports = [];
+    for (let k = 0; k < 600 && this.ports.length < 4; k++) {
+      const x = 60 + rnd() * (W - 120), y = 50 + rnd() * (H - DK.TASKBAR - 100);
+      const sv = sea(x, y);
+      if (sv > -50 || sv < -120) continue;               // 沿岸：陆地边缘那一圈
+      if (this.ports.some(p => Math.hypot(p.x - x, p.y - y) < 300)) continue;
+      const houses = [];
+      for (let i = 0; i < 3 + Math.floor(rnd() * 3); i++)
+        houses.push([x + (rnd() - 0.5) * 52, y + (rnd() - 0.5) * 34, rnd()]);
+      this.ports.push({ x, y, houses });
+    }
+    // 灯塔：沿岸另选两处（离港口远）
+    this.lighthouses = [];
+    for (let k = 0; k < 600 && this.lighthouses.length < 2; k++) {
+      const x = 70 + rnd() * (W - 140), y = 50 + rnd() * (H - DK.TASKBAR - 100);
+      const sv = sea(x, y);
+      if (sv > -55 || sv < -110) continue;
+      if (this.ports.some(p => Math.hypot(p.x - x, p.y - y) < 240)) continue;
+      if (this.lighthouses.some(l => Math.hypot(l.x - x, l.y - y) < 420)) continue;
+      this.lighthouses.push({ x, y, ph: rnd() * 6.283 });
+    }
+    // 航道：两条弯曲虚线穿过海洋
+    this.lanes = [];
+    for (let i = 0; i < 2; i++) {
+      const yA = H * (0.2 + 0.4 * i) + (rnd() - 0.5) * 80;
+      this.lanes.push([
+        [-40, yA + (rnd() - 0.5) * 100],
+        [W * 0.3, yA + (rnd() - 0.5) * 220],
+        [W * 0.7, yA + (rnd() - 0.5) * 220],
+        [W + 40, yA + (rnd() - 0.5) * 100],
+      ]);
+    }
+    // 罗盘玫瑰：右上角
+    this.compass = { x: W - 130, y: 120, r: 44 };
+    // 海怪：深海处（离岛远）1~2 只；图标满屏时海窄，放宽一轮
+    this.monsters = [];
+    for (const [minSea, minGap] of [[140, 500], [70, 380]]) {
+      for (let k = 0; k < 400 && this.monsters.length < 2; k++) {
+        const x = 80 + rnd() * (W - 160), y = 60 + rnd() * (H - DK.TASKBAR - 120);
+        if (sea(x, y) < minSea) continue;
+        if (this.monsters.some(m => Math.hypot(m.x - x, m.y - y) < minGap)) continue;
+        if (this.lanes.some(l => Math.hypot(bez3p(l, 0.5)[0] - x, bez3p(l, 0.5)[1] - y) < 130)) continue;
+        this.monsters.push({ x, y, ph: rnd() * 6.283, s: 0.8 + rnd() * 0.4 });
+      }
+      if (this.monsters.length >= 1) break;
+    }
+    this.dk.invalidate();
+  },
+
+  /* ============================================================
+     帆船：岛屿间的海面上轻轻起伏、慢慢巡航
+     ============================================================ */
+  syncShips() {
+    const DK = this.dk, P = DK.P;
+    const want = Math.max(0, Math.min(6, P.ships | 0));
+    while (this.ships.length > want) this.ships.pop();
+    while (this.ships.length < want) {
+      let s = null;
+      for (let t = 0; t < 400 && !s; t++) {
+        const x = 60 + Math.random() * (DK.W - 120), y = 40 + Math.random() * (DK.H - DK.TASKBAR - 80);
+        if (DK.morph.sample(x, y) < 30) continue;      // 海里（离岛远一点）
+        if (this.ships.some(o => Math.hypot(o.x - x, o.y - y) < 140)) continue;
+        s = { x, y, h: Math.random() * 6.283, v: 9 + Math.random() * 5, wander: Math.random() * 100, bob: Math.random() * 6.283 };
+      }
+      if (!s) break;
+      this.ships.push(s);
+    }
+  },
+  stepShips(dt) {
+    for (const sp of this.ships) {
+      const ax = sp.x + Math.cos(sp.h) * 60, ay = sp.y + Math.sin(sp.h) * 60;
+      if (this.dk.morph.sample(ax, ay) < 18) {         // 前方接近岛屿：转向深海
+        const gx = this.dk.morph.sample(sp.x + 10, sp.y) - this.dk.morph.sample(sp.x - 10, sp.y);
+        const gy = this.dk.morph.sample(sp.x, sp.y + 10) - this.dk.morph.sample(sp.x, sp.y - 10);
+        let d = Math.atan2(gy, gx) - sp.h;
+        d = Math.atan2(Math.sin(d), Math.cos(d));
+        sp.h += Math.sign(d) * Math.min(Math.abs(d), 1.1 * dt);
+      } else {
+        sp.h += (DKT.vnoise(sp.wander += dt * 0.3, 5) - 0.5) * 0.4 * dt;
+      }
+      sp.bob += dt * 2.2;
+      sp.x += Math.cos(sp.h) * sp.v * dt; sp.y += Math.sin(sp.h) * sp.v * dt;
+      if (this.dk.morph.sample(sp.x, sp.y) < 10) {     // 被岛吞了：重新下海
+        const DK = this.dk;
+        for (let t = 0; t < 300; t++) {
+          const x = 60 + Math.random() * (DK.W - 120), y = 40 + Math.random() * (DK.H - DK.TASKBAR - 80);
+          if (DK.morph.sample(x, y) > 40) { sp.x = x; sp.y = y; break; }
+        }
+      }
+    }
+  },
+  drawShip(ctx, sp) {
+    ctx.save();
+    ctx.translate(sp.x, sp.y + Math.sin(sp.bob) * 1.4);
+    ctx.rotate(sp.h);
+    // 手绘帆船：船身弧线 + 一片大三角帆 + 旗
+    ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 1.6;
+    ctx.beginPath();
+    ctx.moveTo(12, 0);
+    ctx.quadraticCurveTo(6, -5, -5, -4.5);
+    ctx.quadraticCurveTo(-12, -4, -13, 0);
+    ctx.quadraticCurveTo(-12, 4, -5, 4.5);
+    ctx.quadraticCurveTo(6, 5, 12, 0);
+    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(1, -3.5); ctx.lineTo(1, -16); ctx.stroke();       // 桅杆
+    ctx.fillStyle = 'rgba(250,244,224,0.9)';
+    ctx.beginPath();
+    ctx.moveTo(2, -15); ctx.quadraticCurveTo(10, -9, 6, -3.5); ctx.lineTo(2, -3.5);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.beginPath();                                                              // 小旗
+    ctx.moveTo(1, -16); ctx.quadraticCurveTo(-3, -15.5, -4, -14); ctx.quadraticCurveTo(-2, -14.6, 1, -14);
+    ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  },
+
+  /* ============================================================
+     静态层：羊皮纸 → 采样铺海/岸线/陆地 → 波纹 → 航道 → 港口 → 灯塔 → 罗盘
+     ============================================================ */
+  drawStatic(ctx, s) {
+    const DK = this.dk, morph = DK.morph;
+    if (this.pendingBuild) this.buildChart();
+    if (!morph.FB) return;
+    const W = DK.W, H = DK.H;
+    const g = ctx.createLinearGradient(0, 0, W, H);
+    g.addColorStop(0, '#f2e2b8'); g.addColorStop(1, '#e8d2a0');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    for (let i = 0; i < 8; i++) {
+      const x = DKT.hash2(i, 3, 71) * W, y = DKT.hash2(i, 5, 72) * H;
+      ctx.fillStyle = i % 2 ? 'rgba(190,150,96,0.06)' : 'rgba(255,246,220,0.08)';
+      ctx.beginPath(); ctx.ellipse(x, y, 170 + DKT.hash2(i, 7, 73) * 230, 110 + DKT.hash2(i, 9, 74) * 140, 0, 0, 6.283); ctx.fill();
+    }
+    // 采样铺色：岛屿（略深）+ 岸线描边 + 海面细密波纹
+    const ST = 8;
+    for (let gy = 0; gy * ST < H; gy++)
+      for (let gx = 0; gx * ST < W; gx++) {
+        const x = gx * ST + ST / 2, y = gy * ST + ST / 2;
+        const sv = DKT.sampleArr(morph.FB.s, x, y);
+        const n = DKT.hash2(gx, gy, 76);
+        if (sv < -8) {
+          // 岛屿陆地：略深的纸色
+          ctx.fillStyle = n < 0.5 ? 'rgba(226,200,149,0.9)' : 'rgba(232,208,158,0.9)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+        } else if (sv < 5) {
+          ctx.fillStyle = 'rgba(122,92,56,0.85)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+        } else if (sv < 14) {
+          ctx.fillStyle = 'rgba(160,128,80,0.4)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+        } else {
+          // 海：细密的小波纹（航海图的特征）
+          if (n > 0.82) {
+            ctx.strokeStyle = 'rgba(122,104,70,0.45)';
+            ctx.lineWidth = 1;
+            const len = 4 + n * 5;
+            ctx.beginPath();
+            ctx.moveTo(x - len, y); ctx.quadraticCurveTo(x - len * 0.4, y - 2.4, x, y);
+            ctx.quadraticCurveTo(x + len * 0.4, y + 2.4, x + len, y);
+            ctx.stroke();
+          }
+        }
+      }
+    // 航道：细虚线
+    ctx.strokeStyle = 'rgba(122,92,56,0.6)';
+    ctx.lineWidth = 1.3;
+    ctx.setLineDash([10, 7]);
+    for (const l of this.lanes) {
+      ctx.beginPath();
+      ctx.moveTo(l[0][0], l[0][1]);
+      ctx.bezierCurveTo(l[1][0], l[1][1], l[2][0], l[2][1], l[3][0], l[3][1]);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+    // 港口小镇：小屋群
+    for (const p of this.ports) {
+      for (const [hx, hy, u] of p.houses) {
+        ctx.fillStyle = '#faf4e0';
+        ctx.fillRect(hx - 3.2, hy - 2.4, 6.4, 4.8);
+        ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 0.8;
+        ctx.strokeRect(hx - 3.2, hy - 2.4, 6.4, 4.8);
+        ctx.fillStyle = u < 0.5 ? '#a04030' : '#8a3528';
+        ctx.beginPath();
+        ctx.moveTo(hx - 3.8, hy - 2.4); ctx.lineTo(hx, hy - 5.6); ctx.lineTo(hx + 3.8, hy - 2.4);
+        ctx.closePath(); ctx.fill();
+      }
+    }
+    // 灯塔：白塔红顶（光束在动态层）
+    for (const l of this.lighthouses) {
+      ctx.fillStyle = '#faf4e0'; ctx.strokeStyle = '#4a3a28'; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(l.x - 4.5, l.y); ctx.lineTo(l.x - 2.5, l.y - 15);
+      ctx.lineTo(l.x + 2.5, l.y - 15); ctx.lineTo(l.x + 4.5, l.y);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#a04030';
+      ctx.beginPath();
+      ctx.moveTo(l.x - 3.4, l.y - 15); ctx.lineTo(l.x, l.y - 19.5); ctx.lineTo(l.x + 3.4, l.y - 15);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    // 罗盘玫瑰
+    const cp = this.compass;
+    ctx.strokeStyle = '#6a5030'; ctx.fillStyle = '#6a5030'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(cp.x, cp.y, cp.r, 0, 6.283); ctx.stroke();
+    ctx.beginPath(); ctx.arc(cp.x, cp.y, cp.r * 0.68, 0, 6.283); ctx.stroke();
+    for (let i = 0; i < 8; i++) {                       // 8 角星：正方向长角 + 斜方向短角
+      const a = i * Math.PI / 4 - Math.PI / 2;
+      const L = i % 2 === 0 ? cp.r * 0.92 : cp.r * 0.6;
+      const w = i % 2 === 0 ? 7 : 4.5;
+      ctx.save();
+      ctx.translate(cp.x, cp.y); ctx.rotate(a);
+      ctx.beginPath();
+      ctx.moveTo(0, -L); ctx.lineTo(w, 0); ctx.lineTo(0, w * 0.4); ctx.lineTo(-w, 0);
+      ctx.closePath();
+      if (i % 2 === 0) { ctx.fill(); } else { ctx.stroke(); }
+      ctx.restore();
+    }
+    ctx.font = '600 12px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('N', cp.x, cp.y - cp.r - 6);
+    ctx.textAlign = 'left';
+  },
+
+  /* ============================================================
+     动态层：帆船 → 灯塔光束 → 海怪
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    const DK = this.dk;
+    this.ft = (this.ft || 0) + dt;
+    // 帆船
+    this.stepShips(dt);
+    for (const sp of this.ships) this.drawShip(ctx, sp);
+    // 灯塔光束：绕塔顶慢转的半透明扇形
+    for (const l of this.lighthouses) {
+      const a = l.ph + this.ft * 0.35;
+      const R = 240;
+      const grad = ctx.createRadialGradient(l.x, l.y - 17, 6, l.x, l.y - 17, R);
+      grad.addColorStop(0, 'rgba(255,244,200,0.34)');
+      grad.addColorStop(1, 'rgba(255,244,200,0)');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(l.x, l.y - 17);
+      ctx.arc(l.x, l.y - 17, R, a - 0.12, a + 0.12);
+      ctx.closePath();
+      ctx.fill();
+    }
+    // 海怪：墨线章鱼——圆头 + 卷触手，轻轻起伏、触手末端摆动
+    for (const m of this.monsters) {
+      const bob = Math.sin(this.ft * 0.8 + m.ph) * 2.4;
+      ctx.save();
+      ctx.translate(m.x, m.y + bob);
+      ctx.scale(m.s, m.s);
+      const INK = 'rgba(74,58,40,0.88)';
+      ctx.strokeStyle = INK; ctx.fillStyle = INK;
+      // 触手：四条贝塞尔，末端小卷随相位摆
+      ctx.lineWidth = 2.4; ctx.lineCap = 'round';
+      for (let i = 0; i < 4; i++) {
+        const side = i < 2 ? -1 : 1;
+        const bx = side * (6 + (i % 2) * 6), by = 8;
+        const sway = Math.sin(this.ft * 1.3 + m.ph + i) * 5;
+        ctx.beginPath();
+        ctx.moveTo(bx * 0.4, 2);
+        ctx.quadraticCurveTo(bx, by, bx + side * 14 + sway, by + 6);
+        ctx.quadraticCurveTo(bx + side * 20 + sway, by + 9, bx + side * 15 + sway, by + 4);
+        ctx.stroke();
+      }
+      // 头：圆滚滚的罩子 + 排线
+      ctx.beginPath();
+      ctx.ellipse(0, -4, 11, 9, 0, Math.PI, 6.283);
+      ctx.quadraticCurveTo(9, 4, 0, 4);
+      ctx.quadraticCurveTo(-9, 4, -11, -4);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(240,226,184,0.5)'; ctx.lineWidth = 1;  // 排线用纸色
+      for (let i = -2; i <= 2; i++) {
+        ctx.beginPath();
+        ctx.moveTo(i * 4, -10 - Math.abs(i) * 0.6);
+        ctx.quadraticCurveTo(i * 4.6, -4, i * 3.4, 3);
+        ctx.stroke();
+      }
+      // 眼睛
+      ctx.fillStyle = '#f0e0b8';
+      ctx.beginPath(); ctx.arc(-3.4, 0.5, 1.5, 0, 6.283); ctx.fill();
+      ctx.beginPath(); ctx.arc(3.4, 0.5, 1.5, 0, 6.283); ctx.fill();
+      ctx.restore();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater(x, y) { return this.dk.morph.sample(x, y) > 4; },
+  iconsChanged() { this.buildChart(); this.syncShips(); },
+  resized() { if (!this.dk) return; this.buildChart(); this.ships.length = 0; this.syncShips(); },
+  seedChanged() { this.buildChart(); this.ships.length = 0; this.syncShips(); },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildChart(); this.ships.length = 0; this.syncShips(); }
+    if (changed.includes('ships')) this.syncShips();
+  },
+};
+
+/* ---------- 工具 ---------- */
+let TRSeed = 1;
+function TRnd() {
+  let a = TRSeed;
+  return () => {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+function bez3p(p, u) {
+  const v = 1 - u;
+  return [
+    v * v * v * p[0][0] + 3 * v * v * u * p[1][0] + 3 * v * u * u * p[2][0] + u * u * u * p[3][0],
+    v * v * v * p[0][1] + 3 * v * v * u * p[1][1] + 3 * v * u * u * p[2][1] + u * u * u * p[3][1],
+  ];
+}
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 粉色森林</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #f5ede2; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 粉色森林主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/pink forest.webp）：米白纸底，一团团半透明的水彩树冠（粉为主，
+  零星奶黄 / 灰绿 / 雾蓝 / 陶橙），细细的墨线树干，黑灰的墨线小鸟
+  - 图标在林间的空地上：融球场围绕图标圈出空地；树按固定的格子撒点生成，
+    树心落在空地外的才留下，冠的半径决定它离空地边多远
+  - 树的可见度跟着场走：图标挪动时，空地扩大的地方树平滑缩小退去、缩小的地方长回来
+  - 分层：离空地远、两种图标布局下都不动的树画进静态层；空地边缘一圈的树每帧
+    在动态层重画（带风摇）；风为 0 且场不在过渡时跳过重画
+  - 小鸟：栖在树干顶，偶尔原地扇两下翅膀，偶尔飞去旁边的树
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '粉色森林 · 原型',
+  // 默认值要和 themes.json 里粉色森林的 default 保持一致
+  params: { sigma: 90, wind: 1, birds: 3 },
+  sliders: [
+    { key: 'sigma', label: '空地大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'wind',  label: '风',       min: 0,  max: 3,   step: 0.05, fmt: v => '×' + v.toFixed(2) },
+    { key: 'birds', label: '小鸟',     min: 0,  max: 8,   step: 1, fmt: v => v + ' 只' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 26);                    // 岸线曲折内部固定：缩略图里树冠的边界本身就是碎的
+    this.ft = 0;                                   // 场景自己的时钟（风摇、鸟扇翅）
+    this.edgeDirty = true;                         // 边缘树要不要重画（commit/参数变化后先画一轮）
+    // buildTrees 在还没有场的时候（init 比第一次 commit 早）先占住空数组
+    this.treesStatic = []; this.treesEdge = []; this.perches = [];
+    this.pendingBuild = true;
+    this.buildTrees();
+    this.birds = [];
+    this.syncBirds();
+  },
+
+  /* ============================================================
+     树：固定格子撒点（hash 带种子，换一张整片森林换样子）
+     ============================================================ */
+  buildTrees() {
+    const W = this.dk.W, H = this.dk.H, morph = this.dk.morph;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const G = 54, BAND = 115, EDGE_MAX = 240;
+    const all = [];
+    for (let gy = -1; gy * G < H + G; gy++) for (let gx = -1; gx * G < W + G; gx++) {
+      // 每格一个随机数源：出不出树、位置偏移、冠大小、配色、样式、干、相位
+      const h = i => DKT.hash2(gx, gy, 30 + i);
+      if (h(0) < 0.24) continue;                   // 留出一些空隙，不是每格都长树
+      const t = {
+        x: (gx + 0.12 + h(1) * 0.76) * G,
+        y: (gy + 0.12 + h(2) * 0.76) * G,
+        r: 15 + h(3) * h(3) * 36,                  // 小树多、大树少
+      };
+      t.rIn = t.r * 0.9 + 10;                      // 树冠允许贴到空地边的最近距离
+      const cp = PALETTE[h(4) < 0.82 ? Math.floor(h(5) * 6) : 6 + Math.floor(h(5) * 4)];
+      t.c1 = cp[0]; t.c2 = cp[1];
+      t.style = Math.floor(h(6) * 5);              // 0 素冠 1 同心环 2 螺旋 3 上下两色 4 双冠
+      t.trunkLen = t.r * (0.45 + h(7) * 0.5);
+      t.bend = (h(8) - 0.5) * t.r * 0.5;           // 干微微歪一点
+      t.phase = h(9) * 6.283;
+      all.push(t);
+    }
+    // 归类：在旧场和新场里都离空地够远的树画进静态层；其余（含过渡时会被空地扫过的）每帧动态画
+    const sA = morph.FA.s, sB = morph.FB.s;
+    const dist = (s, t) => DKT.sampleArr(s, t.x, t.y);
+    for (const t of all) {
+      const kA = (dist(sA, t) - t.rIn) / BAND, kB = (dist(sB, t) - t.rIn) / BAND;
+      t.static = Math.min(kA, kB) > 1;
+    }
+    let edge = all.filter(t => !t.static);
+    if (edge.length > EDGE_MAX) {
+      edge.sort((a, b) => dist(sB, a) - dist(sB, b));   // 越靠近空地边缘的越优先
+      for (const t of edge.slice(EDGE_MAX)) t.static = true;   // 放不下的也画进静态层
+      edge = edge.slice(0, EDGE_MAX);
+    }
+    this.treesStatic = all.filter(t => t.static);
+    this.treesEdge = edge;
+    this.perches = all.map(t => [t.x, t.y + t.r * 0.5 + 2]);   // 干顶：鸟栖的地方
+    this.dk.invalidate();
+  },
+
+  /* ============================================================
+     小鸟：墨线画的黑灰小鸟
+     ============================================================ */
+  syncBirds() {
+    const want = Math.max(0, Math.min(8, Math.round(this.dk.P.birds)));
+    while (this.birds.length > want) this.birds.pop();
+    while (this.birds.length < want) {
+      const perch = Math.floor(Math.random() * Math.max(1, this.perches.length));
+      const [x, y] = this.perches[perch] || [this.dk.W / 2, this.dk.H / 2];
+      this.birds.push({ x, y, perch, state: 'perch', flapT: 3 + Math.random() * 9, flap: 0, to: null, t: 0, from: null });
+    }
+  },
+  stepBirds(dt) {
+    const perches = this.perches;
+    for (const b of this.birds) {
+      if (b.state === 'perch') {
+        b.flap = Math.max(0, b.flap - dt * 2.2);             // 原地扇一下翅膀
+        if ((b.flapT -= dt) <= 0) {
+          b.flapT = 4 + Math.random() * 10;
+          if (Math.random() < 0.4) b.flap = 1;
+          else {                                             // 飞去 320px 内的另一棵树
+            const cand = [];
+            for (let i = 0; i < perches.length; i++) {
+              if (i === b.perch) continue;
+              const d = Math.hypot(perches[i][0] - b.x, perches[i][1] - b.y);
+              if (d > 40 && d < 320) cand.push(i);
+            }
+            if (cand.length) {
+              b.state = 'fly'; b.t = 0; b.from = [b.x, b.y];
+              b.to = perches[cand[Math.floor(Math.random() * cand.length)]];
+            }
+          }
+        }
+      } else {                                               // 飞行：抛物线 + 扇翅
+        b.t += dt / 1.15;
+        if (b.t >= 1) { b.state = 'perch'; b.perch = this.nearestPerch(b.x, b.y); b.flapT = 4 + Math.random() * 8; }
+        else {
+          const e = b.t < 0.5 ? 2 * b.t * b.t : 1 - Math.pow(-2 * b.t + 2, 2) / 2;
+          b.x = b.from[0] + (b.to[0] - b.from[0]) * e;
+          b.y = b.from[1] + (b.to[1] - b.from[1]) * e - Math.sin(Math.PI * b.t) * 52;
+          b.h = Math.atan2(b.to[1] - b.from[1], b.to[0] - b.from[0]);
+        }
+      }
+    }
+  },
+  nearestPerch(x, y) {
+    let best = 0, bd = 1e9;
+    this.perches.forEach(([px, py], i) => { const d = Math.hypot(px - x, py - y); if (d < bd) { bd = d; best = i; } });
+    return best;
+  },
+
+  /* ============================================================
+     静态层：纸底 + 纸颗粒 + 离空地远的树（含不动的干顶）
+     ============================================================ */
+  drawStatic(ctx, s) {
+    if (this.pendingBuild) this.buildTrees();
+    // 纸底：暖白的轻微渐变（左上亮一点）
+    const g = ctx.createLinearGradient(0, 0, this.dk.W, this.dk.H);
+    g.addColorStop(0, '#fbf6ee'); g.addColorStop(1, '#f2e7d8');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, this.dk.W, this.dk.H);
+    // 纸的颗粒：预渲染一小块 pattern 平铺
+    ctx.fillStyle = this.paper(ctx);
+    ctx.fillRect(0, 0, this.dk.W, this.dk.H);
+    for (const t of this.treesStatic) this.drawTree(ctx, t, 1, 0, 2);
+  },
+  paper(ctx) {
+    if (!this._paper || this._paperSeed !== DKT.getSeed()) {
+      this._paperSeed = DKT.getSeed();
+      const c = document.createElement('canvas'); c.width = c.height = 160;
+      const p = c.getContext('2d');
+      for (let i = 0; i < 340; i++) {
+        p.fillStyle = i % 3 ? 'rgba(120,96,70,0.05)' : 'rgba(255,255,255,0.5)';
+        p.fillRect(DKT.hash2(i, 7, 91) * 160, DKT.hash2(i, 13, 92) * 160, 1.2, 1.2);
+      }
+      this._paper = ctx.createPattern(c, 'repeat');
+    }
+    return this._paper;
+  },
+
+  /* ---------- 一棵树：墨线干 + 半透明水彩冠
+     tex：0 无纹理；1 便宜纹理（边缘树每帧重画用）；2 全部纹理（静态树画一次用） ---------- */
+  drawTree(ctx, t, k, sway, tex) {
+    const r = t.r * k;
+    if (r < 2.5) return;
+    const dx = sway * k;
+    // 干：从冠底下方向下伸的一条细墨线，微微弯
+    const topX = t.x + t.bend * k + dx * 0.55, topY = t.y + r * 0.5;
+    const botX = t.x + t.bend * k * 0.4 + dx * 0.12, botY = topY + t.trunkLen * k;
+    ctx.strokeStyle = '#5a463f';
+    ctx.lineWidth = Math.max(1, 1.7 * k);
+    ctx.beginPath();
+    ctx.moveTo(botX, botY);
+    ctx.quadraticCurveTo((topX + botX) / 2 + dx * 0.2, (topY + botY) / 2, topX, topY);
+    ctx.stroke();
+    // 冠：一层主色 + 一层副色（副色偏移一点，透出深浅）
+    ctx.save();
+    ctx.globalAlpha = 0.78;
+    ctx.fillStyle = t.c1;
+    ctx.beginPath(); ctx.arc(t.x + dx, t.y, r, 0, 6.283); ctx.fill();
+    ctx.fillStyle = t.c2;
+    ctx.beginPath(); ctx.arc(t.x + dx + r * 0.13, t.y - r * 0.1, r * 0.9, 0, 6.283); ctx.fill();
+    if (t.style === 4) {                                     // 双冠：上面再叠一个小冠
+      ctx.beginPath(); ctx.arc(t.x + dx + r * 0.5, t.y - r * 0.5, r * 0.42, 0, 6.283); ctx.fill();
+    }
+    if (tex && k > 0.5) {
+      ctx.globalAlpha = 0.5;
+      ctx.strokeStyle = t.c2; ctx.lineWidth = Math.max(0.8, r * 0.045);
+      if (t.style === 1) {                                   // 同心环
+        ctx.beginPath(); ctx.arc(t.x + dx, t.y, r * 0.52, 0, 6.283); ctx.stroke();
+        ctx.beginPath(); ctx.arc(t.x + dx, t.y, r * 0.26, 0, 6.283); ctx.stroke();
+      } else if (t.style === 2 && tex >= 2) {                // 螺旋（两圈半，近似水彩笔纹；只给静态树）
+        ctx.beginPath();
+        for (let i = 0; i <= 46; i++) {
+          const a = i / 46 * Math.PI * 5, rr = r * 0.72 * i / 46;
+          const px = t.x + dx + Math.cos(a) * rr, py = t.y + Math.sin(a) * rr;
+          i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+        }
+        ctx.stroke();
+      } else if (t.style === 2 && tex < 2) {                 // 动态树退化成一道内环
+        ctx.beginPath(); ctx.arc(t.x + dx, t.y, r * 0.4, 0, 6.283); ctx.stroke();
+      } else if (t.style === 3) {                            // 上下两色：下半压一道深色
+        ctx.fillStyle = t.c2;
+        ctx.beginPath();
+        ctx.arc(t.x + dx, t.y, r * 0.985, 0.25, Math.PI - 0.25);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  },
+
+  /* ============================================================
+     动态层：空地边缘的树（风摇 / 过渡生长）+ 小鸟
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    this.ft += dt;
+    const DK = this.dk, morph = DK.morph, P = DK.P;
+    const BAND = 115;
+    const need = P.wind > 0 || morph.morphing || this.edgeDirty;
+    if (need) {
+      for (const t of this.treesEdge) {
+        const k = Math.min(Math.max((morph.sample(t.x, t.y) - t.rIn) / BAND, 0), 1);
+        if (k <= 0.02) continue;
+        const sway = P.wind > 0 ? Math.sin(this.ft * 0.85 + t.phase) * P.wind * 2.3 : 0;
+        this.drawTree(ctx, t, k, sway, true);
+      }
+      this.edgeDirty = morph.morphing || P.wind > 0;
+    }
+    // 小鸟
+    this.stepBirds(dt);
+    for (const b of this.birds) {
+      ctx.save();
+      ctx.translate(b.x, b.y);
+      const INK = '#3a3230';
+      ctx.fillStyle = INK; ctx.strokeStyle = INK; ctx.lineWidth = 1.1; ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.ellipse(0, 0, 4.6, 3.1, 0, 0, 6.283); ctx.fill();          // 身
+      ctx.beginPath(); ctx.arc(4.3, -2.3, 1.9, 0, 6.283); ctx.fill();                 // 头
+      ctx.beginPath(); ctx.moveTo(5.8, -2.7); ctx.lineTo(7.8, -2.1); ctx.stroke();    // 喙
+      ctx.beginPath(); ctx.moveTo(-4.4, 0.3); ctx.lineTo(-8.6, -1.7); ctx.stroke();   // 尾
+      if (b.state === 'perch') {
+        ctx.beginPath(); ctx.moveTo(-0.6, 2.8); ctx.lineTo(-0.6, 5.4); ctx.stroke();  // 腿
+        ctx.beginPath(); ctx.moveTo(1.6, 2.8); ctx.lineTo(1.6, 5.4); ctx.stroke();
+        const wf = b.flap > 0 ? Math.sin(this.ft * 26) * 3.4 : 0;                     // 原地扇两下
+        ctx.beginPath(); ctx.moveTo(-0.5, -1);
+        ctx.quadraticCurveTo(2.5, -4.5 - wf, 5.6, -3 - wf * 0.4); ctx.stroke();       // 翅
+      } else {
+        const wf = Math.sin(this.ft * 15) * 4.5;                                      // 飞行扇翅
+        ctx.beginPath(); ctx.moveTo(0, -1);
+        ctx.quadraticCurveTo(2, -5 - wf, 5, -3.5 - wf * 0.5); ctx.stroke();
+        ctx.beginPath(); ctx.moveTo(-1, -0.5);
+        ctx.quadraticCurveTo(-3.5, -4 - wf * 0.8, -6, -2.5 - wf * 0.4); ctx.stroke();
+      }
+      ctx.restore();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return false; },                 // 林子里没有水面：不激起涟漪
+  iconsChanged() {
+    this.buildTrees();
+    this.edgeDirty = true;
+    this.syncBirds();
+  },
+  resized() {
+    if (!this.dk) return;                      // init 还没跑（scene-kit 启动顺序）时不重建
+    this.buildTrees(); this.edgeDirty = true; this.syncBirds();
+  },
+  seedChanged() {
+    this._paper = null;                        // 颗粒跟着种子换
+    this.buildTrees();
+    this.edgeDirty = true;
+    this.birds.length = 0; this.syncBirds();
+  },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildTrees(); this.edgeDirty = true; this.syncBirds(); }
+    if (changed.includes('birds')) this.syncBirds();
+    if (changed.includes('wind')) this.edgeDirty = true;
+  },
+};
+
+/* ---------- 配色：粉为主，零星奶黄 / 灰绿 / 雾蓝 / 陶橙（取自缩略图） ---------- */
+const PALETTE = [
+  ['#f5c3cd', '#e3a7b4'], ['#efb0c0', '#dc95a7'], ['#e79aae', '#d2829a'],
+  ['#f3ccd3', '#e0b0ba'], ['#dda1b4', '#c98a9f'], ['#ec9fb4', '#d8859e'],
+  ['#f2d9a0', '#dec284'], ['#c9d6a8', '#afc28d'], ['#b9cfd8', '#a0b7c4'], ['#e8a37e', '#d38a62'],
+];
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

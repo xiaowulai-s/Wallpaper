@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 荷塘</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #317375; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 荷塘主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/lotus.webp）：深青绿的塘水，俯视的圆盘荷叶挤满水面——
+  多层绿色 + 叶面深斑 + 放射叶脉 + 缺口叶 + 右下叶影，叶面上零星开着粉色小荷花；
+  一群锦鲤在荷叶和图标之间的开阔水面游来游去，身后荡开一圈圈涟漪
+  - 地形：融球场 s<0 是图标周围的开阔水面，s>0 长荷叶（sigma 控制开阔水面）
+  - 荷叶按格子撒点，密度跟 density；花跟 flowers
+  - 锦鲤：boids 群体，避开荷叶区、被图标吸引，偶尔在身后荡开涟漪
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '荷塘 · 原型',
+  // 默认值要和 themes.json 里荷塘的 default 保持一致
+  params: { sigma: 90, density: 0.9, fish: 8, flowers: 1.5, flow: 1 },
+  sliders: [
+    { key: 'sigma',   label: '开阔水面', min: 40, max: 200, step: 1,    fmt: v => v + ' px' },
+    { key: 'density', label: '荷叶密度', min: 0,  max: 1,   step: 0.01, fmt: v => Math.round(v * 100) + '%' },
+    { key: 'fish',    label: '锦鲤',     min: 0,  max: 12,  step: 1,    fmt: v => v + ' 条' },
+    { key: 'flowers', label: '荷花',     min: 0,  max: 3,   step: 0.5,  fmt: v => '×' + v.toFixed(1) },
+    { key: 'flow',    label: '水波流动', min: 0,  max: 3,   step: 0.05, fmt: v => '×' + v.toFixed(2) },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 26);
+    this.ft = 0;
+    this.pendingBuild = true;
+    this.leavesStatic = []; this.leavesEdge = [];
+    this.pendingBuild = true;
+    this.buildPond();
+    // 锦鲤：避开荷叶区（开阔水面里游），被图标群轻轻吸引
+    this.school = DK2.createSchool({
+      n: P.fish, morph: DK.morph,
+      make: (i, rnd) => {
+        const a = rnd() * 6.28;
+        return {
+          x: DK.W * rnd(), y: DK.H * rnd(), h: a, v: 1, ph: rnd() * 6.28,
+          k: rnd(),                                             // 花色变体
+          pat: [rnd(), rnd()],                                  // 斑纹位置（固定）
+        };
+      },
+      speed: [26, 46], sep: 26, coh: 120, safe: 12,
+      morph: DK.morph,
+      avoid: (x, y) => DK.morph.sample(x, y),                   // < safe 视为荷叶区，避开
+      bounds: () => [DK.W, DK.H - DK.TASKBAR, 30],
+      attractor: () => {                                        // 轻轻被图标群吸引
+        const icons = DK.icons;
+        if (!icons.length) return null;
+        let x = 0, y = 0;
+        for (const ic of icons) { x += ic.x + ic.w / 2; y += ic.y + ic.h / 2; }
+        return [x / icons.length, y / icons.length, 150];
+      },
+    });
+  },
+
+  /* ============================================================
+     荷叶：格子撒点，叶子跟着场长/退（图标挪动时开阔水面平滑变化）
+     ============================================================ */
+  buildPond() {
+    const DK = this.dk, morph = DK.morph, P = DK.P;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const G = 60, BAND = 110;
+    const all = [];
+    for (let gy = -1; gy * G < DK.H + G; gy++)
+      for (let gx = -1; gx * G < DK.W + G; gx++) {
+        const h = i => DKT.hash2(gx, gy, 80 + i);
+        if (h(0) > P.density * 0.94 + 0.03) continue;           // density 0 → 全部隐藏
+        const t = {
+          x: (gx + 0.1 + h(1) * 0.8) * G,
+          y: (gy + 0.1 + h(2) * 0.8) * G,
+          r: 22 + h(3) * h(3) * 44,                             // 大叶多（缩略图里叶子都很大）
+          c: LEAF_COLORS[Math.floor(h(4) * LEAF_COLORS.length)],
+          notch: h(5) < 0.35,                                   // 缺口叶
+          na: h(6) * 6.283,                                     // 缺口方向
+        };
+        t.rIn = t.r * 0.92 + 6;
+        all.push(t);
+      }
+    // 归类：两种布局下都不进开阔水面的叶子进静态层
+    const sA = morph.FA.s, sB = morph.FB.s;
+    const dist = (f, t) => DKT.sampleArr(f, t.x, t.y);
+    for (const t of all) {
+      const kA = (dist(sA, t) - t.rIn) / BAND, kB = (dist(sB, t) - t.rIn) / BAND;
+      t.static = Math.min(kA, kB) > 1;
+    }
+    let edge = all.filter(t => !t.static);
+    if (edge.length > 230) {
+      edge.sort((a, b) => dist(sB, a) - dist(sB, b));
+      for (const t of edge.slice(230)) t.static = true;
+      edge = edge.slice(0, 230);
+    }
+    this.leavesStatic = all.filter(t => t.static);
+    this.leavesEdge = edge;
+    // 花：长在叶面上（荷花开在叶间）；数量跟 flowers
+    this.flowersL = [];
+    const want = Math.round(26 * P.flowers);
+    for (let k = 0; k < 500 && this.flowersL.length < want; k++) {
+      const host = all[Math.floor(Math.random() * all.length)];
+      if (!host || host.r < 24) continue;
+      const a = Math.random() * 6.283, d = host.r * (0.25 + Math.random() * 0.45);
+      const x = host.x + Math.cos(a) * d, y = host.y + Math.sin(a) * d;
+      if (this.flowersL.some(f => Math.hypot(f.x - x, f.y - y) < 60)) continue;
+      this.flowersL.push({ x, y, r: 7 + Math.random() * 6, bud: Math.random() < 0.3, ph: Math.random() * 6.283 });
+    }
+    this.dk.invalidate();
+  },
+
+  /* ---------- 一片荷叶：叶影 → 叶盘 → 缺口 → 深斑 → 叶脉 → 叶缘 ---------- */
+  drawLeaf(ctx, t, k) {
+    const r = t.r * k;
+    if (r < 5) return;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, 0.15 + k);
+    // 叶影：右下偏移的深色椭圆
+    ctx.fillStyle = 'rgba(8,36,30,0.45)';
+    ctx.beginPath(); ctx.ellipse(t.x + r * 0.28, t.y + r * 0.3, r * 0.95, r * 0.85, 0, 0, 6.283); ctx.fill();
+    // 叶盘
+    ctx.fillStyle = t.c;
+    ctx.beginPath(); ctx.arc(t.x, t.y, r, 0, 6.283); ctx.fill();
+    // 缺口：楔形的水色三角（从中心切到边缘）
+    if (t.notch) {
+      ctx.save();
+      ctx.globalCompositeOperation = 'destination-out';
+      ctx.beginPath();
+      ctx.moveTo(t.x, t.y);
+      ctx.arc(t.x, t.y, r + 2, t.na - 0.16, t.na + 0.16);
+      ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      // 缺口卷边：两道细线
+      ctx.strokeStyle = 'rgba(30,80,62,0.55)'; ctx.lineWidth = 1;
+      for (const a of [t.na - 0.16, t.na + 0.16]) {
+        ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(t.x + Math.cos(a) * r, t.y + Math.sin(a) * r); ctx.stroke();
+      }
+    }
+    // 叶面深斑：clip 叶圆后画偏移的深色团
+    ctx.save();
+    ctx.beginPath(); ctx.arc(t.x, t.y, r, 0, 6.283); ctx.clip();
+    ctx.fillStyle = 'rgba(52,120,92,0.4)';
+    ctx.beginPath(); ctx.ellipse(t.x - r * 0.3, t.y + r * 0.25, r * 0.8, r * 0.55, t.na, 0, 6.283); ctx.fill();
+    ctx.restore();
+    // 放射叶脉
+    ctx.strokeStyle = 'rgba(30,84,64,0.5)'; ctx.lineWidth = 1;
+    for (let i = 0; i < 6; i++) {
+      const a = t.na + i * 1.047 + 0.3;
+      ctx.beginPath();
+      ctx.moveTo(t.x + Math.cos(a) * r * 0.12, t.y + Math.sin(a) * r * 0.12);
+      ctx.lineTo(t.x + Math.cos(a) * r * 0.82, t.y + Math.sin(a) * r * 0.82);
+      ctx.stroke();
+    }
+    // 叶缘描边
+    ctx.strokeStyle = 'rgba(24,72,56,0.6)'; ctx.lineWidth = 1.2;
+    ctx.beginPath(); ctx.arc(t.x, t.y, r, 0, 6.283); ctx.stroke();
+    ctx.restore();
+  },
+  drawFlower(ctx, f, k) {
+    const r = f.r * k;
+    if (r < 3) return;
+    ctx.save();
+    ctx.translate(f.x, f.y);
+    ctx.globalAlpha = Math.min(1, 0.2 + k);
+    if (f.bud) {
+      // 花苞：竖椭圆 + 两片萼
+      ctx.fillStyle = '#e894b0';
+      ctx.beginPath(); ctx.ellipse(0, 0, r * 0.42, r * 0.75, f.ph, 0, 6.283); ctx.fill();
+      ctx.fillStyle = '#f4b8c8';
+      ctx.beginPath(); ctx.ellipse(-r * 0.12, -r * 0.1, r * 0.2, r * 0.5, f.ph, 0, 6.283); ctx.fill();
+    } else {
+      // 荷花：两层花瓣 + 黄心
+      ctx.fillStyle = '#f4a0be';
+      for (let i = 0; i < 6; i++) {
+        const a = f.ph + i * 1.047;
+        ctx.beginPath(); ctx.ellipse(Math.cos(a) * r * 0.5, Math.sin(a) * r * 0.5, r * 0.46, r * 0.28, a, 0, 6.283); ctx.fill();
+      }
+      ctx.fillStyle = '#f8c0d2';
+      for (let i = 0; i < 5; i++) {
+        const a = f.ph + 0.5 + i * 1.257;
+        ctx.beginPath(); ctx.ellipse(Math.cos(a) * r * 0.24, Math.sin(a) * r * 0.24, r * 0.34, r * 0.2, a, 0, 6.283); ctx.fill();
+      }
+      ctx.fillStyle = '#f0d060';
+      ctx.beginPath(); ctx.arc(0, 0, r * 0.22, 0, 6.283); ctx.fill();
+    }
+    ctx.restore();
+  },
+
+  /* ============================================================
+     静态层：深青绿的塘水（微渐变 + 深斑）
+     ============================================================ */
+  drawStatic(ctx, s) {
+    const DK = this.dk;
+    if (this.pendingBuild) this.buildPond();
+    const g = ctx.createLinearGradient(0, 0, DK.W, DK.H);
+    g.addColorStop(0, '#2f6b5a'); g.addColorStop(1, '#387a6c');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, DK.W, DK.H);
+    // 水底深斑（大块极淡）
+    for (let i = 0; i < 8; i++) {
+      const x = DKT.hash2(i, 3, 91) * DK.W, y = DKT.hash2(i, 5, 92) * DK.H;
+      ctx.fillStyle = 'rgba(16,58,48,0.16)';
+      ctx.beginPath(); ctx.ellipse(x, y, 200 + DKT.hash2(i, 7, 93) * 260, 130 + DKT.hash2(i, 9, 94) * 160, 0, 0, 6.283); ctx.fill();
+    }
+    // 荷叶：按 y 排序（靠下的在前）
+    const sorted = this.leavesStatic.slice().sort((a, b) => a.y - b.y);
+    for (const t of sorted) this.drawLeaf(ctx, t, 1);
+    // 花
+    for (const f of this.flowersL) this.drawFlower(ctx, f, 1);
+  },
+
+  /* ============================================================
+     动态层：开阔水面边缘的荷叶（退让）→ 锦鲤 → 涟漪
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    const DK = this.dk, morph = DK.morph, P = DK.P;
+    this.ft += dt;
+    if (morph.morphing || this.edgeDirty) {
+      const edge = this.leavesEdge.slice().sort((a, b) => a.y - b.y);
+      for (const t of edge) {
+        const k = Math.min(Math.max((morph.sample(t.x, t.y) - t.rIn) / 110, 0), 1);
+        if (k <= 0.02) continue;
+        this.drawLeaf(ctx, t, k);
+      }
+      this.edgeDirty = morph.morphing;
+    }
+    // 锦鲤：boids 游动，偶尔在身后荡开一圈涟漪
+    this.school.setCount(P.fish);
+    this.school.step(dt);
+    for (const f of this.school.fish) {
+      if (Math.random() < dt * 0.12 && DK.ripples.length < 6)
+        DK.addRipple(f.x - Math.cos(f.h) * 14, f.y - Math.sin(f.h) * 14, 0.8);
+      ctx.save();
+      ctx.translate(f.x, f.y); ctx.rotate(f.h);
+      const wag = Math.sin(f.ph * 1.6) * 2.6;
+      // 尾鳍
+      ctx.fillStyle = KOI[f.k < 0.25 ? 1 : 0];
+      ctx.beginPath();
+      ctx.moveTo(-8, 0); ctx.lineTo(-14, -3.6 + wag); ctx.lineTo(-12, 0); ctx.lineTo(-14, 3.6 + wag);
+      ctx.closePath(); ctx.fill();
+      // 身体：纺锤形
+      ctx.fillStyle = KOI[0];
+      ctx.beginPath(); ctx.ellipse(0, 0, 11.5, 5.4, 0, 0, 6.283); ctx.fill();
+      // 白斑（每条固定位置的两块）
+      ctx.fillStyle = KOI[1];
+      ctx.beginPath(); ctx.ellipse(2.4 + f.pat[0] * 3.4, -0.7, 3.8, 3.4, 0.3, 0, 6.283); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(-4 + f.pat[1] * 2.4, 0.9, 3, 2.8, -0.4, 0, 6.283); ctx.fill();
+      // 头部
+      ctx.fillStyle = f.k < 0.25 ? KOI[1] : KOI[2];
+      ctx.beginPath(); ctx.ellipse(8.4, 0, 3.8, 3.5, 0, 0, 6.283); ctx.fill();
+      // 胸鳍
+      ctx.fillStyle = KOI[1];
+      for (const sd of [-1, 1]) {
+        ctx.beginPath();
+        ctx.ellipse(3.8, sd * 4.8, 3, 1.4, sd * (0.5 + Math.sin(f.ph * 1.6) * 0.2), 0, 6.283);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+    // 涟漪
+    for (const r of DK.ripples) {
+      const age = (performance.now() - r.t0) / 1000;
+      if (age > 3) continue;
+      ctx.strokeStyle = 'rgba(214,238,230,' + (0.6 * (1 - age / 3)).toFixed(3) + ')';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(r.x, r.y, age * 76 * r.str, 0, 6.283); ctx.stroke();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return true; },
+  iconsChanged() { this.buildPond(); this.edgeDirty = true; },
+  resized() { if (!this.dk) return; this.buildPond(); this.edgeDirty = true; },
+  seedChanged() { this.buildPond(); this.edgeDirty = true; },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildPond(); this.edgeDirty = true; }
+    if (changed.includes('density') || changed.includes('flowers')) { this.buildPond(); this.edgeDirty = true; }
+  },
+};
+
+/* ---------- 配色 ---------- */
+const LEAF_COLORS = ['#a8dc9a', '#9fd69a', '#8ccf8e', '#6fbf95', '#58b088', '#7cc492'];
+const KOI = ['#e8642e', '#f8f4ec', '#f0903a'];   // 橙红身 / 白斑 / 头
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

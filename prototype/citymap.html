@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 彩色城市</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #f2ede2; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 彩色城市主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/colorful city.webp）：高角度俯视的插画地图——整片城市斜着排
+  （约 -15°），房子是"红系大屋顶 + 下缘露出一条彩色墙"的伪 3D 色块，墙上点着白色小窗，
+  米白的街道从房子之间穿过
+  - 图标在广场上：融球场围绕图标圈出广场，房子让开；广场就是浅色的空场
+  - 房子按旋转后的网格整齐排布，网格 hash 决定颜色 / 大小 / 烟囱 / 窗阵
+  - 行人：街道上走来走去的彩色小圆点（固定数量，不开放调节）
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '彩色城市 · 原型',
+  // 默认值要和 themes.json 里彩色城市的 default 保持一致
+  params: { sigma: 90 },
+  sliders: [
+    { key: 'sigma', label: '广场大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 24);
+    this.ang = -0.26;                              // 整片城市斜 -15°
+    this.G = 66;                                   // 网格间距（含街道）
+    this.housesStatic = []; this.housesEdge = [];
+    this.pendingBuild = true;
+    this.buildHouses();
+    this.walkers = [];
+    this.syncWalkers();
+    this.ft = 0;
+  },
+
+  /* ============================================================
+     房子：旋转网格撒点，每格几乎都是一栋房子
+     ============================================================ */
+  buildHouses() {
+    const DK = this.dk, morph = DK.morph;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const G = this.G, c = Math.cos(this.ang), s = Math.sin(this.ang);
+    const BAND = 100, EDGE_MAX = 220;
+    // 旋转后需要覆盖的网格范围（把画布四角旋转进网格坐标系）
+    const corners = [[0, 0], [DK.W, 0], [0, DK.H], [DK.W, DK.H]];
+    let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+    for (const [px, py] of corners) {
+      const gx = px * c + py * s, gy = -px * s + py * c;
+      x0 = Math.min(x0, gx); x1 = Math.max(x1, gx); y0 = Math.min(y0, gy); y1 = Math.max(y1, gy);
+    }
+    const all = [];
+    for (let gy = Math.floor(y0 / G); gy * G < y1 + G; gy++)
+      for (let gx = Math.floor(x0 / G); gx * G < x1 + G; gx++) {
+        const h = i => DKT.hash2(gx, gy, 50 + i);
+        if (h(0) < 0.1) continue;                  // 偶尔留一个小院子
+        // 网格坐标 → 屏幕坐标
+        const mx = (gx + 0.08 + h(1) * 0.24) * G, my = (gy + 0.08 + h(2) * 0.24) * G;
+        const t = {
+          x: mx * c - my * s,
+          y: mx * s + my * c,
+          w: 46 + h(3) * 16,                       // 屋顶宽
+          d: 40 + h(4) * 16,                       // 屋顶深
+          wallH: 11 + h(5) * 5,
+          roof: ROOFS[h(6) < 0.86 ? Math.floor(h(7) * 6) : 6 + Math.floor(h(7) * 2)],
+          wall: WALLS[Math.floor(h(8) * WALLS.length)],
+          chimney: h(9) < 0.3,
+          ridge: h(10) < 0.75,                     // 屋脊高光线
+        };
+        t.rIn = Math.max(t.w, t.d) * 0.62 + 14;
+        all.push(t);
+      }
+    // 归类：旧场和新场里都离广场够远的画进静态层
+    const sA = morph.FA.s, sB = morph.FB.s;
+    const dist = (f, t) => DKT.sampleArr(f, t.x, t.y);
+    for (const t of all) {
+      const kA = (dist(sA, t) - t.rIn) / BAND, kB = (dist(sB, t) - t.rIn) / BAND;
+      t.static = Math.min(kA, kB) > 1;
+    }
+    let edge = all.filter(t => !t.static);
+    if (edge.length > EDGE_MAX) {
+      edge.sort((a, b) => dist(sB, a) - dist(sB, b));
+      for (const t of edge.slice(EDGE_MAX)) t.static = true;
+      edge = edge.slice(0, EDGE_MAX);
+    }
+    this.housesStatic = all.filter(t => t.static);
+    this.housesEdge = edge;
+    this.dk.invalidate();
+  },
+
+  /* ---------- 行人：街道上的小圆点，沿街走 ---------- */
+  syncWalkers() {
+    const G = this.G, c = Math.cos(this.ang), s = Math.sin(this.ang);
+    this.walkers = [];
+    for (let i = 0; i < 14; i++) {
+      // 站在街道上：网格坐标里贴着某条街（格子的边界），沿街走
+      const gi = Math.floor(Math.random() * 40) - 10;
+      const gx = gi * G + G * (Math.random() < 0.5 ? 0.04 : 0.96);
+      const gy = (Math.random() * 30 - 5) * G;
+      const along = Math.random() < 0.5;
+      this.walkers.push({
+        mx: along ? Math.random() * 40 * G : gx,
+        my: along ? gy : Math.random() * 40 * G,
+        ax: along ? 1 : 0, ay: along ? 0 : 1,      // 网格系里的走向
+        v: (10 + Math.random() * 10) * (Math.random() < 0.5 ? 1 : -1),
+        c: WALKER_COLORS[i % WALKER_COLORS.length],
+        ph: Math.random() * 6.283,
+      });
+    }
+    this._rc = c; this._rs = s;
+  },
+
+  /* ============================================================
+     静态层：米白地面 + 远处的房子
+     ============================================================ */
+  drawStatic(ctx, s) {
+    if (this.pendingBuild) this.buildHouses();
+    const g = ctx.createLinearGradient(0, 0, this.dk.W, this.dk.H);
+    g.addColorStop(0, '#f4f0e6'); g.addColorStop(1, '#eee8da');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, this.dk.W, this.dk.H);
+    // 街道比地面浅一点：整个街区旋转后铺一层浅色网格线（街道两侧的缘石）
+    const sorted = this.housesStatic.slice().sort((a, b) => a.y - b.y);
+    for (const t of sorted) this.drawHouse(ctx, t, 1);
+  },
+
+  /* ---------- 一栋房子：墙（带白窗点阵）+ 红系屋顶（屋脊高光 + 烟囱）
+     房子在旋转后的局部坐标里画（以屋子中心为原点），整片城市随街道斜排 ---------- */
+  drawHouse(ctx, t, k) {
+    const w = t.w * k, d = t.d * k, wallH = t.wallH * k;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, 0.1 + k);
+    ctx.translate(t.x, t.y);
+    ctx.rotate(this.ang);
+    // 墙：屋顶下缘露出的一条彩色，白色小窗点阵
+    ctx.fillStyle = t.wall;
+    ctx.fillRect(-w / 2, d / 2 - wallH, w, wallH);
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    const cols = Math.max(2, Math.floor(w / 12)), rows = wallH > 12 ? 2 : 1;
+    for (let r = 0; r < rows; r++)
+      for (let i = 0; i < cols; i++)
+        ctx.fillRect(-w / 2 + (i + 0.5) * w / cols - 1.1, d / 2 - wallH + (r + 0.5) * wallH / rows - 1.1, 2.2, 2.2);
+    // 屋顶：红系大色块
+    ctx.fillStyle = t.roof;
+    ctx.fillRect(-w / 2, -d / 2 - wallH, w, d);
+    // 屋脊高光：靠上的一条浅色
+    if (t.ridge) {
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.fillRect(-w / 2, -d / 2 - wallH + d * 0.16, w, Math.max(1.4, d * 0.08));
+    }
+    // 烟囱：屋顶一角的小深色方块
+    if (t.chimney) {
+      ctx.fillStyle = 'rgba(60,40,36,0.55)';
+      ctx.fillRect(w * 0.22, -d / 2 - wallH + d * 0.18, Math.max(3, w * 0.09), Math.max(3, d * 0.12));
+    }
+    ctx.restore();
+  },
+
+  /* ============================================================
+     动态层：广场边缘的房子（过渡生长）+ 行人
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    this.ft += dt;
+    const DK = this.dk, morph = DK.morph, P = DK.P;
+    const BAND = 100;
+    if (morph.morphing || this.edgeDirty) {
+      const edge = this.housesEdge.slice().sort((a, b) => a.y - b.y);
+      for (const t of edge) {
+        const k = Math.min(Math.max((morph.sample(t.x, t.y) - t.rIn) / BAND, 0), 1);
+        if (k <= 0.02) continue;
+        this.drawHouse(ctx, t, k);
+      }
+      this.edgeDirty = morph.morphing;
+    }
+    // 行人：在网格坐标系里模拟，旋转后画到屏幕上
+    const c = this._rc, sn = this._rs, G = this.G, lim = (Math.max(DK.W, DK.H) / G | 0) + 8;
+    for (const p of this.walkers) {
+      p.ph += dt * 9;
+      if (p.ax) { p.mx += p.v * dt; if (p.mx < -lim * G || p.mx > lim * G) p.mx = -p.mx < 0 ? lim * G : 0; }
+      else { p.my += p.v * dt; if (p.my < -lim * G || p.my > lim * G) p.my = p.my < 0 ? lim * G : 0; }
+      const bob = Math.abs(Math.sin(p.ph)) * 0.8;
+      const px = p.mx * c - p.my * sn, py = p.mx * sn + p.my * c - bob;
+      ctx.fillStyle = p.c;
+      ctx.beginPath(); ctx.arc(px, py, 2.6, 0, 6.283); ctx.fill();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return false; },
+  iconsChanged() {
+    this.buildHouses();
+    this.edgeDirty = true;
+    this.syncWalkers();
+  },
+  resized() {
+    if (!this.dk) return;
+    this.buildHouses(); this.edgeDirty = true; this.syncWalkers();
+  },
+  seedChanged() {
+    this.buildHouses();
+    this.edgeDirty = true;
+    this.syncWalkers();
+  },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildHouses(); this.edgeDirty = true; }
+  },
+};
+
+/* ---------- 配色（取自缩略图）：红系屋顶为主，少量蓝/灰；墙黄粉蓝橙绿 ---------- */
+const ROOFS = ['#c9383a', '#d95c3a', '#b04535', '#a03030', '#c04838', '#8a3a3a', '#5a7a9a', '#9a9088'];
+const WALLS = ['#f0c860', '#f0a0a8', '#6a9ac0', '#e09850', '#8ab070', '#f4f1ea', '#d08050'];
+const WALKER_COLORS = ['#4a4a55', '#c9383a', '#3a6a9a', '#8a5a9a', '#2a7a4a', '#c08030', '#8a8a92'];
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

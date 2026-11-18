@@ -1,0 +1,330 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 大海</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #2a72d4; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 大海主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/ocean.webp + 草地主题的云）：干净的扁平蓝色海面，
+  零星的小白点浪花；图标藏在白云里（圆鼓鼓的卡通云，和草地同一套），
+  云影落在海面上；白色帆船 / 游艇慢慢开，帆影和尾迹落在海面上，海鸥上空盘旋
+  - 云：融球场围绕图标的云团 + 天上整朵飘的云（kit-2d 的云模块，和草地同一套）
+  - 船：开阔海面上 wander + 避开云团；尾迹是最近一段航迹的两条白线
+  - 海鸟：俯视的白色海鸥，直飞 / 盘旋切换，扇翅
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '大海 · 原型',
+  // 默认值要和 themes.json 里大海的 default 保持一致
+  params: { sigma: 75, cover: 0.3, flow: 1, boats: 2, yachts: 1, birds: 4 },
+  sliders: [
+    { key: 'sigma', label: '云团大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'cover', label: '海上的云', min: 0, max: 1, step: 0.01, fmt: v => Math.round(v * 100) + '%' },
+    { key: 'flow',  label: '流动速度', min: 0, max: 3, step: 0.05, fmt: v => '×' + v.toFixed(2) },
+    { key: 'boats', label: '帆船',     min: 0, max: 6, step: 1, fmt: v => v + ' 艘' },
+    { key: 'yachts', label: '游艇',    min: 0, max: 4, step: 1, fmt: v => v + ' 艘' },
+    { key: 'birds', label: '海鸟',     min: 0, max: 8, step: 1, fmt: v => v + ' 只' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 30);
+    this.mass = DK2.createCloudMass({ morph: DK.morph, getEdge: () => 6, R: 80 });   // 图标周围的云团（比草地薄：要露出海面）
+    this.sky = DK2.createFreeClouds({ getCover: () => P.cover, getFlow: () => P.flow, getH: () => DK.TASKBAR });
+    this.fts = 0;                                  // 云的时钟（跟流动速度）
+    this.boats = [];                               // 帆船 + 游艇一起存
+    this.birds = [];
+    this.syncBoats();
+    this.syncBirds();
+  },
+
+  /* ============================================================
+     船：帆船（白帆 + 帆影 + 尾迹）和游艇（白身灰窗 + 尾迹）一起管理
+     spawn：开阔海面（离云远）、彼此不太挤
+     ============================================================ */
+  spawnBoat(kind) {
+    const DK = this.dk;
+    // 两轮尝试：先挑离云远、彼此不挤的位置；找不到就放宽（图标多、云团大时海面本来就窄）
+    for (const [minS, minGap] of [[60, 150], [24, 90]]) {
+      for (let t = 0; t < 300; t++) {
+        const x = 60 + Math.random() * (DK.W - 120), y = 40 + Math.random() * (DK.H - DK.TASKBAR - 100);
+        if (DK.morph.sample(x, y) < minS) continue;                      // 离云团远一点
+        if (this.boats.some(b => Math.hypot(b.x - x, b.y - y) < minGap)) continue;
+        return {
+          x, y, kind,
+          h: Math.random() * Math.PI * 2,
+          v: kind === 'sail' ? 11 + Math.random() * 6 : 17 + Math.random() * 8,
+          wander: Math.random() * 100,
+          trail: [],                                                     // 航迹（尾迹用）
+        };
+      }
+    }
+    return null;
+  },
+  syncBoats() {
+    const DK = this.dk, P = DK.P;
+    // 多出来的船直接删掉；不够的在开阔海面补
+    const trim = (kind, want) => {
+      const list = this.boats.filter(b => b.kind === kind);
+      for (let i = list.length - 1; i >= want; i--)
+        this.boats.splice(this.boats.indexOf(list[i]), 1);
+    };
+    trim('sail', P.boats | 0);
+    trim('yacht', P.yachts | 0);
+    while (this.boats.filter(b => b.kind === 'sail').length < (P.boats | 0)) { const b = this.spawnBoat('sail'); if (!b) break; this.boats.push(b); }
+    while (this.boats.filter(b => b.kind === 'yacht').length < (P.yachts | 0)) { const b = this.spawnBoat('yacht'); if (!b) break; this.boats.push(b); }
+  },
+  stepBoats(dt) {
+    const DK = this.dk;
+    for (const b of this.boats) {
+      // 慢慢改变航向：wander + 避开云团（前方变浅就朝开阔处拐）+ 别出画面
+      let steer = (DKT.vnoise(b.wander += dt * 0.3, b.kind === 'sail' ? 1 : 7) - 0.5) * 0.5;
+      const ax = b.x + Math.cos(b.h) * 80, ay = b.y + Math.sin(b.h) * 80;
+      const off = ax < 50 || ay < 40 || ax > DK.W - 50 || ay > DK.H - DK.TASKBAR - 50;
+      if (DK.morph.sample(ax, ay) < 50 || off) {
+        const gx = DK.morph.sample(b.x + 12, b.y) - DK.morph.sample(b.x - 12, b.y);
+        const gy = DK.morph.sample(b.x, b.y + 12) - DK.morph.sample(b.x, b.y - 12);
+        steer = Math.atan2(gy + (off ? (DK.H - DK.TASKBAR) / 2 - b.y : 0) * 0.001,
+          gx + (off ? DK.W / 2 - b.x : 0) * 0.001) - b.h;
+        steer = Math.atan2(Math.sin(steer), Math.cos(steer)) > 0 ? 0.7 : -0.7;
+      }
+      b.h += steer * dt;
+      b.x += Math.cos(b.h) * b.v * dt;
+      b.y += Math.sin(b.h) * b.v * dt;
+      // 尾迹：记下最近的航迹点
+      b.trail.push([b.x, b.y]);
+      if (b.trail.length > 26) b.trail.shift();
+      if (DK.morph.sample(b.x, b.y) < 40) { const n = this.spawnBoat(b.kind); if (n) Object.assign(b, n); }
+    }
+  },
+  drawBoat(ctx, b) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.h);
+    if (b.kind === 'sail') {
+      // 帆影：主帆的形状往右下偏移，深蓝色
+      ctx.save();
+      ctx.translate(16, 22);
+      ctx.fillStyle = 'rgba(16,54,120,0.5)';
+      ctx.beginPath();
+      ctx.moveTo(0, 0); ctx.lineTo(-26, -12); ctx.lineTo(-2, -14); ctx.closePath();
+      ctx.moveTo(0, 0); ctx.lineTo(16, 10); ctx.lineTo(-14, 12); ctx.closePath();
+      ctx.fill();
+      ctx.restore();
+      // 船身：白色椭圆，船头略尖
+      ctx.fillStyle = '#fbfdff'; ctx.strokeStyle = 'rgba(120,150,190,0.6)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(13, 0);
+      ctx.quadraticCurveTo(6, -5.5, -8, -4.5);
+      ctx.lineTo(-13, -2.5); ctx.lineTo(-13, 2.5); ctx.lineTo(-8, 4.5);
+      ctx.quadraticCurveTo(6, 5.5, 13, 0);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      // 帆：主帆（大三角）+ 前帆，被风吹得鼓起来
+      ctx.fillStyle = '#fbfdff'; ctx.strokeStyle = '#d5e4f5'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(1, 0); ctx.lineTo(-24, -10); ctx.lineTo(0, -12); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(3, 0); ctx.lineTo(16, 9); ctx.lineTo(-12, 11); ctx.closePath();
+      ctx.fill(); ctx.stroke();
+    } else {
+      // 游艇：白色船体 + 深灰驾驶舱 + 浅灰座席
+      ctx.fillStyle = '#fbfdff'; ctx.strokeStyle = 'rgba(120,150,190,0.6)'; ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(15, 0);
+      ctx.quadraticCurveTo(7, -6.5, -9, -5.5);
+      ctx.lineTo(-14, -3); ctx.lineTo(-14, 3); ctx.lineTo(-9, 5.5);
+      ctx.quadraticCurveTo(7, 6.5, 15, 0);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#5a6a7a';
+      ctx.fillRect(-4, -3.2, 10, 6.4);
+      ctx.fillStyle = '#d5dde5';
+      ctx.fillRect(-10, -2.4, 5, 4.8);
+      ctx.fillRect(7.5, -2, 4, 4);
+    }
+    ctx.restore();
+    // 尾迹：航迹两侧的两条白线（越靠船尾越近、越远越淡）
+    const tr = b.trail;
+    if (tr.length > 4) {
+      ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 2;
+      for (const side of [-1, 1]) {
+        ctx.beginPath();
+        for (let i = 2; i < tr.length; i += 2) {
+          const dx = tr[i][0] - tr[i - 2][0], dy = tr[i][1] - tr[i - 2][1];
+          const l = Math.hypot(dx, dy) || 1;
+          const px = -dy / l, py = dx / l;                       // 航迹的法线
+          const w = 3 + (i / tr.length) * 9;                     // 越往后（离船越远）越宽
+          const X = tr[i][0] + px * w * side, Y = tr[i][1] + py * w * side;
+          i === 2 ? ctx.moveTo(X, Y) : ctx.lineTo(X, Y);
+        }
+        ctx.stroke();
+      }
+    }
+  },
+
+  /* ============================================================
+     海鸟：俯视的白色海鸥（白身 + 浅灰翅 + 黑翅尖），直飞/盘旋切换
+     ============================================================ */
+  syncBirds() {
+    const DK = this.dk;
+    const want = Math.max(0, Math.min(8, DK.P.birds | 0));
+    while (this.birds.length > want) this.birds.pop();
+    while (this.birds.length < want)
+      this.birds.push({
+        x: Math.random() * DK.W, y: Math.random() * (DK.H - DK.TASKBAR),
+        h: Math.random() * 6.283, v: 34 + Math.random() * 16,
+        mode: 0, modeT: 2 + Math.random() * 4, ph: Math.random() * 6.283, wander: Math.random() * 100,
+      });
+  },
+  stepBirds(dt) {
+    const DK = this.dk, H2 = DK.H - DK.TASKBAR, m = 90;
+    this.birds.forEach((b, i) => {
+      if ((b.modeT -= dt) <= 0) {
+        b.mode = Math.random() < 0.4 ? (Math.random() < 0.5 ? -1 : 1) : 0;
+        b.modeT = b.mode ? 4 + Math.random() * 6 : 3 + Math.random() * 5;
+      }
+      b.wander += dt * 0.4;
+      if (b.x < -m || b.x > DK.W + m || b.y < -m || b.y > H2 + m)
+        b.h = DK2.turnToward(b.h, Math.atan2(H2 / 2 - b.y, DK.W / 2 - b.x), 1.3 * dt);
+      else b.h += (b.mode * 0.55 + (DKT.vnoise(b.wander, i * 7.3) - 0.5) * 0.8) * dt;
+      if (Math.cos(b.ph) < 0.97 || Math.random() < 0.002) b.ph = (b.ph + dt * 9) % 6.283;
+      b.x += Math.cos(b.h) * b.v * dt; b.y += Math.sin(b.h) * b.v * dt;
+    });
+  },
+  drawBird(ctx, b) {
+    const span = 0.68 + 0.32 * Math.cos(b.ph);         // 翅膀展开程度（扇翅时变短）
+    // 影子：落在海面上，偏右下、很淡
+    ctx.save();
+    ctx.translate(b.x + 30, b.y + 48); ctx.rotate(b.h);
+    ctx.fillStyle = 'rgba(16,54,120,0.28)';
+    ctx.beginPath(); ctx.ellipse(0, 0, 7, 2.2, 0, 0, 6.283); ctx.fill();
+    ctx.restore();
+    ctx.save();
+    ctx.translate(b.x, b.y); ctx.rotate(b.h);
+    // 翅膀：两片，展开程度随扇翅变化
+    const reach = 15 * span;
+    ctx.fillStyle = '#dfe5ec';
+    for (const side of [-1, 1]) {
+      ctx.beginPath();
+      ctx.moveTo(1, side * 1.2);
+      ctx.quadraticCurveTo(-3, side * reach * 0.7, -6, side * reach);
+      ctx.lineTo(-1, side * reach * 0.82);
+      ctx.quadraticCurveTo(3, side * reach * 0.45, 4, side * 1.2);
+      ctx.closePath(); ctx.fill();
+      // 黑翅尖
+      ctx.fillStyle = '#3a4250';
+      ctx.beginPath();
+      ctx.ellipse(-5, side * reach * 0.92, 2, 1.4, side * 0.5, 0, 6.283); ctx.fill();
+      ctx.fillStyle = '#dfe5ec';
+    }
+    // 白身子 + 黄嘴
+    ctx.fillStyle = '#fbfdff';
+    ctx.beginPath(); ctx.ellipse(0.5, 0, 6.4, 2, 0, 0, 6.283); ctx.fill();
+    ctx.fillStyle = '#f0b040';
+    ctx.beginPath(); ctx.ellipse(7, 0, 1.6, 0.9, 0, 0, 6.283); ctx.fill();
+    ctx.restore();
+  },
+
+  /* ============================================================
+     静态层：蓝海渐变 + 大块极淡明暗 + 白色浪花点缀
+     ============================================================ */
+  drawStatic(ctx, s) {
+    const DK = this.dk;
+    const g = ctx.createLinearGradient(0, 0, DK.W, DK.H);
+    g.addColorStop(0, '#2a72d4'); g.addColorStop(1, '#3a86e0');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, DK.W, DK.H);
+    // 大块的极淡明暗（远处海色稍深、近处稍亮）
+    for (let i = 0; i < 7; i++) {
+      const x = DKT.hash2(i, 3, 71) * DK.W, y = DKT.hash2(i, 5, 72) * DK.H;
+      const rx = 180 + DKT.hash2(i, 7, 73) * 320, ry = 120 + DKT.hash2(i, 9, 74) * 200;
+      ctx.fillStyle = i % 2 ? 'rgba(20,60,140,0.06)' : 'rgba(120,180,255,0.06)';
+      ctx.beginPath(); ctx.ellipse(x, y, rx, ry, DKT.hash2(i, 11, 75) * 3, 0, 6.283); ctx.fill();
+    }
+    // 白色浪花：稀疏的小白点和短弧线
+    for (let i = 0; i < 260; i++) {
+      const x = DKT.hash2(i, 3, 81) * DK.W, y = DKT.hash2(i, 5, 82) * DK.H;
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      if (i % 4 === 3) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.6)'; ctx.lineWidth = 1.1;
+        ctx.beginPath(); ctx.arc(x, y, 1.8 + DKT.hash2(i, 7, 83) * 2, 0.4, 2.6); ctx.stroke();
+      } else {
+        ctx.fillRect(x, y, 1.6, 1.6);
+      }
+    }
+  },
+
+  /* ============================================================
+     动态层：云影 → 云（图标云团 + 天上的云）→ 船 → 海鸟
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    const DK = this.dk;
+    this.fts += dt * DK.P.flow;
+    this.sky.step(dt, this.fts, DK.W, DK.H);       // 天上的云：数量随 cover、整朵随风飘
+    const mass = this.mass.update(now / 1000, this.fts, DK.W, DK.H);
+    const SHADOW = { body: 'rgba(10,40,100,0.34)', edge: 'rgba(10,40,100,0.34)', shade: 'rgba(10,40,100,0.34)' };
+    // 云影：整团云往右下偏移，把海面压成深蓝
+    DK2.paintCloud(ctx, mass.map((v, i) => i % 4 === 0 ? v + 115 : i % 4 === 1 ? v + 156 : v), {}, SHADOW);
+    for (const c of this.sky.list)
+      DK2.paintCloud(ctx, DK2.expandCloud(c, this.fts, 115, 156), {}, SHADOW);
+    // 船（在云影上面、云的下面）
+    this.stepBoats(dt);
+    for (const b of this.boats) this.drawBoat(ctx, b);
+    // 云本体
+    DK2.paintCloud(ctx, mass, {});
+    for (const c of this.sky.list) DK2.paintCloud(ctx, DK2.expandCloud(c, this.fts), {});
+    // 海鸟（在最上面：它们飞得高）
+    this.stepBirds(dt);
+    for (const b of this.birds) this.drawBird(ctx, b);
+    // 涟漪：点击海面 / 图标落水
+    _paintRipple(ctx, DK);
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return true; },                    // 点击海面 / 图标落水都有涟漪
+  iconsChanged() { this.syncBoats(); },
+  resized() {
+    if (!this.dk) return;
+    this.sky.clear();
+    this.boats.length = 0; this.syncBoats();
+  },
+  seedChanged() { this.sky.clear(); this.boats.length = 0; this.syncBoats(); },
+  onParams(changed) {
+    if (changed.includes('boats') || changed.includes('yachts')) this.syncBoats();
+    if (changed.includes('birds')) this.syncBirds();
+    if (changed.includes('sigma')) this.syncBoats();
+  },
+};
+
+/* 涟漪：点击海面 / 图标落水的细白圈（2D 版） */
+const _paintRipple = (ctx, DK) => {
+  for (const r of DK.ripples) {
+    const age = (performance.now() - r.t0) / 1000;
+    if (age > 3) continue;
+    ctx.strokeStyle = 'rgba(255,255,255,' + (0.65 * (1 - age / 3)).toFixed(3) + ')';
+    ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.arc(r.x, r.y, age * 80 * r.str, 0, 6.283); ctx.stroke();
+  }
+};
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 湖泊</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #0faeae; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 湖泊主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/lake.webp）：水彩的湖——黄绿的草地绕着图标（岸线弯弯绕绕），
+  湖水从近岸的青绿往深处过渡，近岸浅水里露出青绿石块，岸边一圈深色的湿线；
+  湖面清晰映出圆鼓鼓的云朵，波光缓缓流动
+  - 地形：融球场（s<0 草地、s>0 湖水），sigma 控制草岸宽度、warp 控制岸线曲折
+  - 静态层：按 8px 采样格铺色——草地（点彩水彩）、湿岸线、浅滩（透出湖底）、石块
+  - 动态层：湖面的倒影云（跟天上飘的云同步）+ 波光 + 涟漪
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '湖泊 · 原型',
+  // 默认值要和 themes.json 里湖泊的 default 保持一致
+  params: { sigma: 85, warp: 36, shoal: 130, depth: 300, clouds: 3, flow: 1 },
+  sliders: [
+    { key: 'sigma', label: '草岸宽度', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'warp',  label: '岸线曲折', min: 0,  max: 80,  step: 1, fmt: v => v + '' },
+    { key: 'shoal', label: '清澈浅滩', min: 0,  max: 300, step: 1, fmt: v => v + ' px' },
+    { key: 'depth', label: '湖水深浅', min: 120, max: 700, step: 1, fmt: v => v + ' px' },
+    { key: 'clouds', label: '湖面的云', min: 0, max: 6, step: 1, fmt: v => v + ' 朵' },
+    { key: 'flow',  label: '水波流动', min: 0, max: 3, step: 0.05, fmt: v => '×' + v.toFixed(2) },
+  ],
+  fieldKeys: ['sigma', 'warp'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => P.warp);
+    // 天上的云（湖面倒影的源头）：数量跟 clouds 参数（几朵就是几朵）
+    this.sky = DK2.createFreeClouds({ getCover: () => DK.P.clouds / 10, getFlow: () => DK.P.flow, getH: () => DK.TASKBAR, R: 100 });
+    this.mass = DK2.createCloudMass({ morph: DK.morph, getEdge: () => 8, R: 92 });   // 图标草地上的云
+    this.fts = 0;
+    // 波光点：湖面上的亮斑，慢慢漂
+    this.sparkles = [];
+    for (let i = 0; i < 70; i++)
+      this.sparkles.push({
+        x: Math.random() * DK.W, y: Math.random() * (DK.H - DK.TASKBAR),
+        ph: Math.random() * 6.283, len: 6 + Math.random() * 12,
+      });
+  },
+
+  /* ============================================================
+     静态层：湖水渐变打底 → 按 8px 采样格铺草地/湿岸线/浅滩/石块
+     ============================================================ */
+  drawStatic(ctx, s) {
+    const DK = this.dk, morph = DK.morph;
+    if (!morph.FB) return;
+    const P = DK.P, W = DK.W, H = DK.H;
+    // 湖水：从近岸青绿到深湖的渐变
+    const g = ctx.createLinearGradient(0, 0, W * 0.6, H);
+    g.addColorStop(0, '#0cbab8'); g.addColorStop(1, '#12948e');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+    // 采样铺色：草地（点彩水彩）、湿岸线、浅滩、石块
+    const ST = 8;
+    for (let gy = 0; gy * ST < H; gy++)
+      for (let gx = 0; gx * ST < W; gx++) {
+        const x = gx * ST + ST / 2, y = gy * ST + ST / 2;
+        const sv = morph.FB ? DKT.sampleArr(morph.FB.s, x, y) : 999;
+        const n = DKT.hash2(gx, gy, 66);               // 每格自己的随机数
+        if (sv < -6) {
+          // 草地：黄绿点彩——每格一个带随机偏移的圆，叠出有机的水彩颗粒感
+          const t = n * 0.5 + DKT.hash2(gx, gy, 67) * 0.5;
+          ctx.fillStyle = t < 0.5 ? 'rgba(184,204,120,0.9)' : t < 0.8 ? 'rgba(198,215,136,0.9)' : 'rgba(170,192,108,0.9)';
+          ctx.beginPath();
+          ctx.arc(x + (n - 0.5) * 5, y + (DKT.hash2(gx, gy, 69) - 0.5) * 5, ST * 0.62 + n * 1.6, 0, 6.283);
+          ctx.fill();
+        } else if (sv < 4) {
+          // 湿岸线：一圈深色（草贴着水的湿边）
+          ctx.fillStyle = 'rgba(96,110,58,0.8)';
+          ctx.beginPath();
+          ctx.arc(x + (n - 0.5) * 4, y + (DKT.hash2(gx, gy, 69) - 0.5) * 4, ST * 0.6, 0, 6.283);
+          ctx.fill();
+        } else if (sv < P.shoal * 0.5 + 4) {
+          // 浅滩：透出湖底的水色，越往湖里越被水色盖住
+          const k = 1 - (sv - 4) / (P.shoal * 0.5);
+          ctx.fillStyle = 'rgba(150,222,206,' + (0.4 * k).toFixed(3) + ')';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+          // 石块：浅滩里的青绿石块（稀疏）
+          if (sv > 10 && sv < P.shoal && n > 0.93) {
+            const r = 3 + DKT.hash2(gx, gy, 68) * 4;
+            ctx.fillStyle = '#3e8a80';
+            ctx.beginPath(); ctx.ellipse(x, y, r * 1.3, r, n * 3, 0, 6.283); ctx.fill();
+            ctx.fillStyle = '#6ab8a8';
+            ctx.beginPath(); ctx.ellipse(x - r * 0.3, y - r * 0.3, r * 0.55, r * 0.4, n * 3, 0, 6.283); ctx.fill();
+          }
+        } else if (sv < P.shoal + 30 && n > 0.75) {
+          // 浅滩外缘：偶尔一块深一点的石头（快看不清了）
+          ctx.fillStyle = 'rgba(40,110,104,0.5)';
+          ctx.beginPath(); ctx.arc(x, y, 3.5, 0, 6.283); ctx.fill();
+        }
+        if (sv > P.depth * 0.8) {
+          // 深水：离岸超过 depth 的地方湖水更深（depth 控制深浅过渡）
+          ctx.fillStyle = 'rgba(10,110,106,0.45)';
+          ctx.fillRect(gx * ST, gy * ST, ST, ST);
+        }
+      }
+    // 草地上稀疏的草笔触
+    for (let i = 0; i < 240; i++) {
+      const x = DKT.hash2(i, 3, 86) * W, y = DKT.hash2(i, 5, 87) * H;
+      if (morph.sample(x, y) > -4) continue;           // 只画在草地上
+      const len = 3 + DKT.hash2(i, 7, 88) * 4;
+      ctx.strokeStyle = 'rgba(140,164,84,0.6)';
+      ctx.lineWidth = 1.3;
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(x + len, y + (DKT.hash2(i, 9, 89) - 0.5) * 2); ctx.stroke();
+    }
+  },
+
+  /* ============================================================
+     动态层：湖面的倒影云 → 波光 → 涟漪
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    const DK = this.dk;
+    this.fts += dt * DK.P.flow;
+    this.sky.step(dt, this.fts, DK.W, DK.H);
+    const mass = this.mass;
+    const circles = mass.update(now / 1000, this.fts, DK.W, DK.H);
+    const OFF = [70, 118];                             // 倒影相对云的偏移（湖面在"下方"）
+    // 倒影云：圆心在湖里的圆才画（草地那侧不画）；比真云淡、颜色偏湖色
+    const refl = [];
+    for (let i = 0; i < circles.length; i += 4) {
+      if (DK.morph.sample(circles[i] + OFF[0] * 0.4, circles[i + 1] + OFF[1] * 0.6) > -14)
+        refl.push(circles[i] + OFF[0], circles[i + 1] + OFF[1], circles[i + 2], circles[i + 3]);
+    }
+    for (const c of this.sky.list) {
+      const cc = DK2.expandCloud(c, this.fts, OFF[0], OFF[1]);
+      for (let i = 0; i < cc.length; i += 4) {
+        if (DK.morph.sample(cc[i] - OFF[0] * 0.4, cc[i + 1] - OFF[1] * 0.6) > -14)
+          refl.push(cc[i], cc[i + 1], cc[i + 2], cc[i + 3]);
+      }
+    }
+    DK2.paintCloud(ctx, refl, {}, {
+      body: 'rgba(214,238,234,0.5)', edge: 'rgba(230,246,242,0.5)', shade: 'rgba(190,224,218,0.5)', litW: 8,
+    });
+    // 波光：湖面上的小白亮斑，随水波流动闪
+    ctx.lineWidth = 1.6; ctx.lineCap = 'round';
+    for (const sp of this.sparkles) {
+      if (DK.morph.sample(sp.x, sp.y) < 14) continue;  // 只画在湖里
+      const tw = 0.4 + 0.6 * Math.sin(this.ft * 1.1 * DK.P.flow + sp.ph);
+      if (tw < 0.55) continue;
+      ctx.strokeStyle = 'rgba(240,252,248,' + (0.7 * tw).toFixed(3) + ')';
+      ctx.beginPath(); ctx.moveTo(sp.x - sp.len / 2, sp.y); ctx.lineTo(sp.x + sp.len / 2, sp.y); ctx.stroke();
+    }
+    // 涟漪：点击湖面 / 图标落水
+    for (const r of DK.ripples) {
+      const age = (performance.now() - r.t0) / 1000;
+      if (age > 3) continue;
+      ctx.strokeStyle = 'rgba(240,252,248,' + (0.65 * (1 - age / 3)).toFixed(3) + ')';
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.arc(r.x, r.y, age * 80 * r.str, 0, 6.283); ctx.stroke();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater(x, y) { return this.dk.morph.sample(x, y) > 4; },   // 图标拖进湖里 / 点湖面都有涟漪
+  iconsChanged() {},
+  resized() { if (!this.dk) return; this.sky.clear(); },
+  seedChanged() { this.sky.clear(); },
+  onParams(changed) {
+    if (changed.includes('sigma') || changed.includes('warp')) this.dk.invalidate();
+    if (changed.includes('clouds')) { /* sky.step 的 want 由 getCover 实时取，无需处理 */ }
+  },
+};
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>

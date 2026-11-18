@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wallpaper · 手绘城市</title>
+<link rel="stylesheet" href="lib/ui.css">
+<style>
+  html, body { background: #f3eed0; }
+</style>
+</head>
+<body>
+<canvas id="art"></canvas>
+<div id="desktop"></div>
+<!--
+  Wallpaper · 手绘城市主题（Canvas2D：静态层 + 局部动态层，30fps）
+  画风参考（thumbs/hand draw city.webp）：米黄纸底的老城鸟瞰地图——
+  一排排立面小屋（米白墙 + 墨线描边 + 砖红屋顶）沿街密排，草绿色的运河斜穿全城，
+  运河上有小桥和慢慢走的小船，墨线风车在城里慢慢转，散着几棵小圆树和手写地名
+  - 图标在广场上：融球场围绕图标圈出广场，房子让开
+  - 房子按"排"密排（行距 = 街宽），运河穿过的地方房子跳开
+  - 动态：运河小船、风车叶片
+-->
+<script src="lib/terrain.js"></script>
+<script src="lib/kit-2d.js"></script>
+<script src="lib/host-link.js"></script>
+<script>
+'use strict';
+window.THEME = {
+  title: '手绘城市 · 原型',
+  // 默认值要和 themes.json 里手绘城市的 default 保持一致
+  params: { sigma: 90, canals: 2 },
+  sliders: [
+    { key: 'sigma',  label: '广场大小', min: 40, max: 200, step: 1, fmt: v => v + ' px' },
+    { key: 'canals', label: '运河',     min: 0,  max: 3,   step: 1, fmt: v => v + ' 条' },
+  ],
+  fieldKeys: ['sigma'],
+
+  init(DK) {
+    const P = DK.P;
+    this.dk = DK;
+    DK.morph = DKT.createMorph(
+      () => DK.icons.map(ic => ({ cx: ic.x + ic.w / 2, cy: ic.y + ic.h / 2, hw: ic.w / 2 - 4, hh: ic.h / 2 - 2 })),
+      () => P.sigma, () => 22);
+    this.ft = 0;
+    this.edgeDirty = true;
+    this.housesStatic = []; this.housesEdge = [];
+    this.pendingBuild = true;
+    this.buildTown();
+  },
+
+  /* ============================================================
+     城区：运河（贝塞尔路径）→ 房子按排密排（避开运河和广场）→ 桥/树/风车/地名
+     ============================================================ */
+  buildTown() {
+    const DK = this.dk, morph = DK.morph;
+    if (!morph.FB) { this.pendingBuild = true; return; }
+    this.pendingBuild = false;
+    const W = DK.W, H = DK.H, rnd = K2rnd();
+    _townSeed = DKT.getSeed() | 1;                 // 城区随机数跟种子走：换一张整片城区换样子
+    const wantCanals = Math.max(0, Math.min(3, Math.round(DK.P.canals)));
+    // 运河：每条一条三段贝塞尔（从上边到下边，x 各异）；采样成折线供距离判断
+    this.canals = [];
+    for (let i = 0; i < wantCanals; i++) {
+      const xa = W * (0.15 + 0.7 * i / Math.max(1, wantCanals) + (rnd() - 0.5) * 0.12);
+      const pts = [
+        [xa + (rnd() - 0.5) * 160, -60],
+        [xa + (rnd() - 0.5) * 300, H * 0.35],
+        [xa + (rnd() - 0.5) * 300, H * 0.7],
+        [xa + (rnd() - 0.5) * 160, H + 60],
+      ];
+      const samples = [];
+      for (let t = 0; t <= 40; t++) {
+        const u = t / 40;
+        const [px, py] = bez3(pts, u);
+        samples.push([px, py]);
+      }
+      this.canals.push({ pts, samples, len: 0 });
+    }
+    const canalDist = (x, y) => {
+      let d = 1e9;
+      for (const cn of this.canals)
+        for (const [px, py] of cn.samples) {
+          const dd = Math.hypot(px - x, py - y) - 24;   // 半宽 24
+          if (dd < d) d = dd;
+        }
+      return d;                                        // <0 在运河里
+    };
+    // 房子：一排排密排（行距 76 = 房深 + 街；列距 = 房宽 + 2~10px 缝）
+    const all = [];
+    const ROW = 76;
+    for (let ry = 0; ry * ROW < H + ROW; ry++) {
+      const y = ry * ROW + 40 + (rnd() - 0.5) * 8;
+      let x = -20 + rnd() * 30;
+      while (x < W + 40) {
+        const h = i => DKT.hash2(Math.round(x), ry, 60 + i);
+        const w = 40 + h(0) * 14, d = 34 + h(1) * 10;
+        const cx = x + w / 2, cy = y + d / 2;
+        x += w + 2 + h(2) * 8;
+        if (rnd() < 0.06) { x += 30; continue; }       // 偶尔一个缺口
+        const t = {
+          x: cx, y: cy, w, d,
+          roof: ROOFS[Math.floor(h(3) * ROOFS.length)],
+          wall: h(4) < 0.75 ? '#faf6e8' : '#f0e4c8',
+          win: 2 + Math.floor(h(5) * 3),               // 正面窗户数
+          door: h(6) < 0.5,
+        };
+        t.rIn = Math.max(t.w, t.d) * 0.6 + 12;
+        t.kCanal = canalDist(cx, cy);
+        if (t.kCanal < 10) continue;                   // 运河穿过的地方没有房子
+        all.push(t);
+      }
+    }
+    // 归类（同前两个主题）
+    const sA = morph.FA.s, sB = morph.FB.s;
+    const dist = (f, t) => DKT.sampleArr(f, t.x, t.y);
+    for (const t of all) {
+      const kA = (dist(sA, t) - t.rIn) / 100, kB = (dist(sB, t) - t.rIn) / 100;
+      t.static = Math.min(kA, kB) > 1;
+    }
+    let edge = all.filter(t => !t.static);
+    if (edge.length > 220) {
+      edge.sort((a, b) => dist(sB, a) - dist(sB, b));
+      for (const t of edge.slice(220)) t.static = true;
+      edge = edge.slice(0, 220);
+    }
+    this.housesStatic = all.filter(t => t.static);
+    this.housesEdge = edge;
+    // 树：小圆树，避开运河和广场（按最终场筛选）
+    this.trees = [];
+    for (let i = 0; i < 60; i++) {
+      const x = rnd() * W, y = rnd() * H, r = 5 + rnd() * 6;
+      if (canalDist(x, y) < 14) continue;
+      if (dist(sB, { x, y }) < r + 12) continue;
+      this.trees.push({ x, y, r, dark: rnd() < 0.5 });
+    }
+    // 风车：0~2 座，离广场远
+    this.mills = [];
+    for (let i = 0; i < 2; i++) {
+      for (let k = 0; k < 40; k++) {
+        const x = 60 + rnd() * (W - 120), y = 60 + rnd() * (H - 120);
+        if (dist(sB, { x, y }) < 60 || canalDist(x, y) < 30) continue;
+        if (this.mills.some(m => Math.hypot(m.x - x, m.y - y) < 260)) continue;
+        this.mills.push({ x, y, s: 20 + rnd() * 8, ph: rnd() * 6.283 });
+        break;
+      }
+    }
+    // 小船：每条运河 1~2 条，沿路径参数 t 走
+    this.boats = [];
+    this.canals.forEach((cn, ci) => {
+      const n = 1 + (rnd() < 0.5 ? 1 : 0);
+      for (let i = 0; i < n; i++)
+        this.boats.push({ cn: ci, t: rnd(), v: (0.006 + rnd() * 0.004) * (rnd() < 0.5 ? 1 : -1), cargo: CARGO[Math.floor(rnd() * CARGO.length)] });
+    });
+    // 手写地名
+    this.labels = [];
+    const NAMES = ['Canal Street', 'Old Town', 'Market Square', 'Mill Lane', 'Harbor Rd', 'East Ward'];
+    for (let i = 0; i < Math.min(3, NAMES.length); i++) {
+      for (let k = 0; k < 30; k++) {
+        const x = 80 + rnd() * (W - 160), y = 60 + rnd() * (H - 120);
+        if (dist(sB, { x, y }) < 80 || canalDist(x, y) < 40) continue;
+        if (this.labels.some(l => Math.hypot(l.x - x, l.y - y) < 240)) continue;
+        this.labels.push({ x, y, text: NAMES[i] });
+        break;
+      }
+    }
+    this.dk.invalidate();
+  },
+
+  /* ============================================================
+     静态层：纸底 + 房子 + 运河 + 桥 + 树 + 风车塔 + 地名
+     ============================================================ */
+  drawStatic(ctx, s) {
+    if (this.pendingBuild) this.buildTown();
+    const g = ctx.createLinearGradient(0, 0, this.dk.W, this.dk.H);
+    g.addColorStop(0, '#f6f1d8'); g.addColorStop(1, '#efe8c8');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, this.dk.W, this.dk.H);
+    this.drawCanals(ctx);
+    const sorted = this.housesStatic.slice().sort((a, b) => a.y - b.y);
+    for (const t of sorted) this.drawHouse(ctx, t, 1);
+    // 小圆树
+    for (const t of this.trees) {
+      ctx.strokeStyle = '#5b4a3a'; ctx.lineWidth = 1.2;
+      ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(t.x, t.y - t.r * 0.7); ctx.stroke();
+      ctx.fillStyle = t.dark ? '#7a9a5a' : '#a8c070';
+      ctx.strokeStyle = '#5b4a3a'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(t.x, t.y - t.r * 0.9, t.r, 0, 6.283); ctx.fill(); ctx.stroke();
+    }
+    // 风车塔（叶片在动态层转）
+    for (const m of this.mills) {
+      ctx.fillStyle = '#faf6e8'; ctx.strokeStyle = '#5b4a3a'; ctx.lineWidth = 1.4;
+      ctx.beginPath();
+      ctx.moveTo(m.x - m.s * 0.4, m.y); ctx.lineTo(m.x - m.s * 0.18, m.y - m.s * 1.5);
+      ctx.lineTo(m.x + m.s * 0.18, m.y - m.s * 1.5); ctx.lineTo(m.x + m.s * 0.4, m.y);
+      ctx.closePath(); ctx.fill(); ctx.stroke();
+      ctx.fillStyle = '#a04030';
+      ctx.beginPath();
+      ctx.moveTo(m.x - m.s * 0.3, m.y - m.s * 1.42); ctx.lineTo(m.x, m.y - m.s * 1.75);
+      ctx.lineTo(m.x + m.s * 0.3, m.y - m.s * 1.42); ctx.closePath(); ctx.fill(); ctx.stroke();
+    }
+    // 手写地名
+    ctx.fillStyle = 'rgba(122,96,74,0.75)';
+    ctx.font = 'italic 13px "Segoe Print", "Segoe UI", serif';
+    for (const l of this.labels) ctx.fillText(l.text, l.x, l.y);
+  },
+  drawCanals(ctx) {
+    for (const cn of this.canals) {
+      const path = () => {
+        ctx.beginPath();
+        ctx.moveTo(cn.pts[0][0], cn.pts[0][1]);
+        ctx.bezierCurveTo(cn.pts[1][0], cn.pts[1][1], cn.pts[2][0], cn.pts[2][1], cn.pts[3][0], cn.pts[3][1]);
+      };
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = '#7a9a55'; ctx.lineWidth = 38; path(); ctx.stroke();   // 岸
+      ctx.strokeStyle = '#a8c070'; ctx.lineWidth = 32; path(); ctx.stroke();   // 水面
+      ctx.strokeStyle = '#c8d890'; ctx.lineWidth = 18; path(); ctx.stroke();   // 亮带
+      // 小桥
+      for (const u of [0.25, 0.55, 0.82]) {
+        const [px, py] = bez3(cn.pts, u);
+        const [tx, ty] = tang3(cn.pts, u);
+        const a = Math.atan2(ty, tx);
+        ctx.save(); ctx.translate(px, py); ctx.rotate(a);
+        ctx.fillStyle = '#8a7060'; ctx.strokeStyle = '#5b4a3a'; ctx.lineWidth = 1.2;
+        ctx.fillRect(-8, -24, 16, 48); ctx.strokeRect(-8, -24, 16, 48);
+        ctx.restore();
+      }
+    }
+  },
+
+  /* ---------- 一栋立面小屋：米白墙 + 墨线描边 + 小窗 + 砖红屋顶 ---------- */
+  drawHouse(ctx, t, k) {
+    const w = t.w * k, d = t.d * k;
+    if (w < 4) return;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, 0.1 + k);
+    const x = t.x - w / 2, y = t.y;
+    ctx.lineWidth = Math.max(0.8, 1.3 * k);
+    ctx.strokeStyle = '#5b4a3a';
+    // 正面墙
+    ctx.fillStyle = t.wall;
+    ctx.fillRect(x, y, w, d);
+    ctx.strokeRect(x, y, w, d);
+    // 砖红屋顶：上窄下宽的梯形
+    ctx.fillStyle = t.roof;
+    ctx.beginPath();
+    ctx.moveTo(x - w * 0.06, y);
+    ctx.lineTo(x + w * 0.18, y - d * 0.78);
+    ctx.lineTo(x + w * 0.82, y - d * 0.78);
+    ctx.lineTo(x + w * 1.06, y);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    // 屋顶瓦纹：两道浅线
+    if (k > 0.6) {
+      ctx.strokeStyle = 'rgba(90,60,50,0.4)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x + w * 0.1, y - d * 0.26); ctx.lineTo(x + w * 0.98, y - d * 0.26); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(x + w * 0.14, y - d * 0.5); ctx.lineTo(x + w * 0.92, y - d * 0.5); ctx.stroke();
+      ctx.strokeStyle = '#5b4a3a'; ctx.lineWidth = Math.max(0.8, 1.3 * k);
+    }
+    // 窗：深色小方块
+    ctx.fillStyle = '#4a3a35';
+    for (let i = 0; i < t.win; i++) {
+      const wx = x + (i + 0.5) * w / t.win - 2.4, wy = y + d * 0.3;
+      ctx.fillRect(wx, wy, 4.8 * k, 6 * k);
+    }
+    // 门
+    if (t.door) {
+      ctx.fillStyle = '#8a5a3a';
+      ctx.fillRect(x + w * 0.38, y + d * 0.62, w * 0.24, d * 0.38);
+      ctx.strokeRect(x + w * 0.38, y + d * 0.62, w * 0.24, d * 0.38);
+    }
+    ctx.restore();
+  },
+
+  /* ============================================================
+     动态层：广场边缘的房子 + 运河小船 + 风车叶片
+     ============================================================ */
+  frame(now, dt, ctx, s) {
+    this.ft += dt;
+    const DK = this.dk, morph = DK.morph;
+    if (morph.morphing || this.edgeDirty) {
+      const edge = this.housesEdge.slice().sort((a, b) => a.y - b.y);
+      for (const t of edge) {
+        const k = Math.min(Math.max((morph.sample(t.x, t.y) - t.rIn) / 100, 0), 1);
+        if (k <= 0.02) continue;
+        this.drawHouse(ctx, t, k);
+      }
+      this.edgeDirty = morph.morphing;
+    }
+    // 运河小船：沿贝塞尔路径慢慢走，到头折返
+    for (const b of this.boats) {
+      const cn = this.canals[b.cn];
+      if (!cn) continue;
+      b.t += b.v * dt;
+      if (b.t > 0.97) { b.t = 0.97; b.v = -b.v; }
+      if (b.t < 0.03) { b.t = 0.03; b.v = -b.v; }
+      const [px, py] = bez3(cn.pts, b.t);
+      const [tx, ty] = tang3(cn.pts, b.t);
+      const a = Math.atan2(ty, tx) + (b.v > 0 ? 0 : Math.PI);
+      ctx.save();
+      ctx.translate(px, py); ctx.rotate(a);
+      ctx.fillStyle = '#5b4a3a'; ctx.strokeStyle = '#3a2e2a'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.ellipse(0, 0, 13, 4.6, 0, 0, 6.283); ctx.fill(); ctx.stroke();   // 船身
+      ctx.fillStyle = b.cargo;
+      ctx.fillRect(-5, -3.4, 10, 6.8);                                                       // 货舱
+      ctx.strokeStyle = '#3a2e2a'; ctx.strokeRect(-5, -3.4, 10, 6.8);
+      ctx.restore();
+      // 船尾的水纹
+      ctx.strokeStyle = 'rgba(250,246,226,0.7)'; ctx.lineWidth = 1.2;
+      ctx.beginPath();
+      ctx.moveTo(px - Math.cos(a) * 15, py - Math.sin(a) * 15);
+      ctx.quadraticCurveTo(px - Math.cos(a) * 24, py - Math.sin(a) * 24 - 3, px - Math.cos(a) * 32, py - Math.sin(a) * 32);
+      ctx.stroke();
+    }
+    // 风车叶片：绕塔顶慢慢转
+    for (const m of this.mills) {
+      const cx = m.x, cy = m.y - m.s * 1.75, r = m.s * 1.1;
+      const a0 = m.ph + this.ft * 0.5;
+      ctx.strokeStyle = '#5b4a3a'; ctx.lineWidth = 2;
+      ctx.fillStyle = 'rgba(250,246,232,0.9)';
+      for (let i = 0; i < 4; i++) {
+        const a = a0 + i * Math.PI / 2;
+        ctx.save();
+        ctx.translate(cx, cy); ctx.rotate(a);
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(r, -r * 0.16);
+        ctx.lineTo(r, r * 0.16);
+        ctx.closePath();
+        ctx.fill(); ctx.stroke();
+        ctx.restore();
+      }
+      ctx.fillStyle = '#5b4a3a';
+      ctx.beginPath(); ctx.arc(cx, cy, 2.2, 0, 6.283); ctx.fill();
+    }
+  },
+
+  /* ---------- 场景钩子 ---------- */
+  isWater() { return false; },
+  iconsChanged() { this.buildTown(); this.edgeDirty = true; },
+  resized() { if (!this.dk) return; this.buildTown(); this.edgeDirty = true; },
+  seedChanged() { this.buildTown(); this.edgeDirty = true; },
+  onParams(changed) {
+    if (changed.includes('sigma')) { this.buildTown(); this.edgeDirty = true; }
+    if (changed.includes('canals')) { this.buildTown(); this.edgeDirty = true; }
+  },
+};
+
+/* ---------- 贝塞尔工具 ---------- */
+function bez3(p, u) {
+  const v = 1 - u;
+  return [
+    v * v * v * p[0][0] + 3 * v * v * u * p[1][0] + 3 * v * u * u * p[2][0] + u * u * u * p[3][0],
+    v * v * v * p[0][1] + 3 * v * v * u * p[1][1] + 3 * v * u * u * p[2][1] + u * u * u * p[3][1],
+  ];
+}
+function tang3(p, u) {
+  const v = 1 - u;
+  return [
+    3 * v * v * (p[1][0] - p[0][0]) + 6 * v * u * (p[2][0] - p[1][0]) + 3 * u * u * (p[3][0] - p[2][0]),
+    3 * v * v * (p[1][1] - p[0][1]) + 6 * v * u * (p[2][1] - p[1][1]) + 3 * u * u * (p[3][1] - p[2][1]),
+  ];
+}
+/* 城内专用的可复现随机数（重建城区时用固定种子，换一张才换） */
+let _townSeed = 1;
+function K2rnd() {
+  let a = _townSeed;
+  return () => {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+/* ---------- 配色 ---------- */
+const ROOFS = ['#a04030', '#8a3528', '#b0503c', '#7a3025', '#9a4535'];
+const CARGO = ['#c08030', '#8a9a5a', '#6a8aa0', '#b06050'];
+</script>
+<script src="lib/scene-kit.js"></script>
+<script src="share.js"></script>   <!-- 分享图片 / 分享动画（示例图标、名字是色块） -->
+</body>
+</html>
